@@ -1,6 +1,8 @@
 """
-Alpha Protocol Network - Configuration Management
+APN Core - Configuration Management
 Centralized configuration system with proper validation and defaults.
+
+Part of the Alpha Protocol Network (APN Core v1.0.0)
 """
 import json
 import logging
@@ -11,6 +13,19 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 logger = logging.getLogger(__name__)
+
+# APN Core Version
+APN_CORE_VERSION = "1.0.0"
+APN_PROTOCOL_VERSION = "alpha/1.0.0"
+
+# Default NATS relay for mesh networking
+DEFAULT_NATS_RELAY = "nats://nonlocal.info:4222"
+
+# Default known peers (Pythia master node)
+DEFAULT_KNOWN_PEERS = [
+    "https://dashboard.powerclubglobal.com",
+    "https://pythia.nonlocal.info",
+]
 
 @dataclass
 class NodeIdentity:
@@ -28,11 +43,12 @@ class NetworkConfig:
     tunnel_enabled: bool = True
     tunnel_provider: str = "cloudflare"  # cloudflare, wireguard, i2p
     discovery_enabled: bool = True
+    nats_relay: str = DEFAULT_NATS_RELAY
     known_peers: List[str] = None
 
     def __post_init__(self):
         if self.known_peers is None:
-            self.known_peers = []
+            self.known_peers = DEFAULT_KNOWN_PEERS.copy()
 
 @dataclass
 class RadioConfig:
@@ -74,6 +90,16 @@ class APNConfig:
     network: NetworkConfig
     radio: RadioConfig
     services: ServicesConfig
+
+    @property
+    def version(self) -> str:
+        """Get APN Core version"""
+        return APN_CORE_VERSION
+
+    @property
+    def protocol_version(self) -> str:
+        """Get APN protocol version"""
+        return APN_PROTOCOL_VERSION
     
     @classmethod
     def load(cls, config_path: Optional[Path] = None) -> 'APNConfig':

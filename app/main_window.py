@@ -16,7 +16,8 @@ class MainWindow(QMainWindow):
     def __init__(self, config=None):
         super().__init__()
         self.config = config
-        self.setWindowTitle("Alpha Protocol Network - Node Dashboard")
+        version = getattr(config, 'version', '1.0.0') if config else '1.0.0'
+        self.setWindowTitle(f"APN Core Dashboard v{version} - Alpha Protocol Network")
         
         # Set minimum and default window size
         self.setMinimumSize(1200, 800)
