@@ -1,8 +1,8 @@
-# APN Core Dashboard v1.0.0
+# APN CORE v1.0.0
 
 **Alpha Protocol Network - Sovereign Mesh Networking**
 
-A PyQt6-based dashboard for managing APN Core nodes, enabling devices to contribute resources to the Alpha Protocol Network mesh.
+A PyQt6-based dashboard for managing APN CORE nodes, enabling devices to contribute resources to the Alpha Protocol Network mesh.
 
 ## Features
 
@@ -28,7 +28,7 @@ The APN Core server will start automatically on port 8000.
 ## Architecture
 
 ```
-alpha-dashboard/
+apn-core/
 ├── main.py                 # Application entry point
 ├── apn_server.py           # APN Core FastAPI server
 ├── core/
@@ -98,4 +98,4 @@ See `requirements.txt` for full dependencies.
 
 ## License
 
-Part of the Alpha Protocol Network project.
+Part of the APN CORE project - Alpha Protocol Network.

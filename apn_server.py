@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-APN Core Server - Alpha Protocol Network Core Services
-Main entry point for APN Dashboard providing mesh networking,
-peer registration, wearable integration, and device contribution.
+APN CORE Server - Alpha Protocol Network Core Services
+Production-ready server with proper security, logging, and persistence.
 
 Version: 1.0.0
 """
@@ -12,24 +11,36 @@ import base64
 import json
 import os
 import platform
-import secrets
 import hashlib
+import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field, field_validator
 import uvicorn
 import httpx
+
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Cryptography for secure channel
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.exceptions import InvalidSignature
+
+# Local modules
+from core.settings import get_settings, APNSettings
+from core.database import get_database, close_database, APNDatabase
+from core.logging_config import setup_logging, get_logger
 
 # System resources
 try:
@@ -38,52 +49,116 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
+# Initialize logging
+logger = get_logger("server")
+
 # APN Core Version
 APN_CORE_VERSION = "1.0.0"
 APN_PROTOCOL_VERSION = "alpha/1.0.0"
 
-def get_public_bytes(key):
+
+def get_public_bytes(key) -> bytes:
     """Get raw public key bytes (compatible with different cryptography versions)"""
     if hasattr(key, 'public_bytes_raw'):
         return key.public_bytes_raw()
     return key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
-def get_private_bytes(key):
+
+def get_private_bytes(key) -> bytes:
     """Get raw private key bytes (compatible with different cryptography versions)"""
     if hasattr(key, 'private_bytes_raw'):
         return key.private_bytes_raw()
     return key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
 
-NORA_URL = "http://127.0.0.1:3003"
 
-# Default NATS relay for mesh networking
-DEFAULT_NATS_RELAY = "nats://nonlocal.info:4222"
+# ============= Request Models with Validation =============
 
-# Known peers for mesh networking (Pythia master node)
-KNOWN_PEERS = [
-    "https://dashboard.powerclubglobal.com",
-    "https://pythia.nonlocal.info",
-]
+class PeerRegistration(BaseModel):
+    """Peer registration request with validation"""
+    nodeId: str = Field(..., min_length=4, max_length=128, description="Node identifier")
+    publicKey: str = Field(..., min_length=32, max_length=256, description="Hex-encoded public key")
+    paymentAddress: Optional[str] = Field(default="", max_length=256)
+    roles: Optional[List[str]] = Field(default_factory=list, max_length=10)
+    settings: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    signature: Optional[str] = Field(default=None, description="Ed25519 signature for verification")
+    timestamp: Optional[int] = Field(default=None, description="Unix timestamp for replay protection")
 
-# Peer connection state
-peer_connections: Dict[str, Dict[str, Any]] = {}
+    @field_validator("publicKey")
+    @classmethod
+    def validate_public_key(cls, v):
+        """Validate hex-encoded public key"""
+        try:
+            key_bytes = bytes.fromhex(v)
+            if len(key_bytes) != 32:
+                raise ValueError("Public key must be 32 bytes")
+        except ValueError as e:
+            raise ValueError(f"Invalid public key format: {e}")
+        return v
 
-app = FastAPI(
-    title="APN Core Server",
-    description="Alpha Protocol Network - Sovereign mesh networking for device contribution",
-    version=APN_CORE_VERSION
-)
 
-# CORS for cross-origin requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class HandshakeMessage(BaseModel):
+    """Secure handshake request"""
+    type: str = Field(..., pattern="^handshake_init$")
+    node_id: str = Field(..., min_length=4, max_length=128)
+    public_key: str = Field(..., min_length=32, max_length=256)
+    ephemeral_key: str = Field(..., description="Base64-encoded ephemeral X25519 public key")
+    timestamp: int = Field(..., ge=0)
+    signature: str = Field(..., description="Base64-encoded Ed25519 signature")
 
-# ============= Data Models =============
+
+class TaskCreate(BaseModel):
+    """Task creation request"""
+    title: str = Field(..., min_length=1, max_length=500)
+    description: Optional[str] = Field(default="", max_length=5000)
+    assigned_to: Optional[str] = Field(default="", max_length=128)
+    priority: Optional[str] = Field(default="medium", pattern="^(low|medium|high|urgent)$")
+    status: Optional[str] = Field(default="pending", pattern="^(pending|in_progress|completed|cancelled)$")
+    due_date: Optional[str] = Field(default=None)
+
+
+class TaskUpdate(BaseModel):
+    """Task update request"""
+    title: Optional[str] = Field(default=None, max_length=500)
+    description: Optional[str] = Field(default=None, max_length=5000)
+    assigned_to: Optional[str] = Field(default=None, max_length=128)
+    priority: Optional[str] = Field(default=None, pattern="^(low|medium|high|urgent)$")
+    status: Optional[str] = Field(default=None, pattern="^(pending|in_progress|completed|cancelled)$")
+    due_date: Optional[str] = Field(default=None)
+
+
+class SecureMessage(BaseModel):
+    """Encrypted message from peer"""
+    from_peer: str = Field(..., alias="from", min_length=4, max_length=128)
+    payload: str = Field(..., description="Base64-encoded encrypted payload")
+
+
+class ContributionSettings(BaseModel):
+    """Device contribution settings"""
+    enabled: bool = False
+    relay: bool = False
+    compute: bool = False
+    storage: bool = False
+    storage_gb_allocated: int = Field(default=10, ge=0, le=10000)
+    compute_cores_allocated: int = Field(default=1, ge=0, le=256)
+    bandwidth_limit_mbps: int = Field(default=100, ge=0, le=10000)
+
+
+class MeshMessage(BaseModel):
+    """Mesh network message"""
+    dest_node: str = Field(..., min_length=1, max_length=128)
+    payload: Dict[str, Any]
+    hop_count: Optional[int] = Field(default=0, ge=0, le=10)
+
+
+class WearableState(BaseModel):
+    """Wearable device state"""
+    ring_connected: Optional[bool] = None
+    glasses_connected: Optional[bool] = None
+    battery_level: Optional[int] = Field(default=None, ge=0, le=100)
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+
+# ============= Global State =============
 
 @dataclass
 class APNPeerNode:
@@ -95,46 +170,142 @@ class APNPeerNode:
     connected_at: datetime = field(default_factory=datetime.now)
     websocket: Optional[WebSocket] = None
 
-class PeerRegistration(BaseModel):
-    nodeId: str
-    publicKey: str
-    paymentAddress: Optional[str] = ""
-    roles: Optional[List[str]] = []
-    settings: Optional[Dict[str, Any]] = {}
-
-class HandshakeMessage(BaseModel):
-    type: str
-    node_id: str
-    public_key: str
-    ephemeral_key: str
-    timestamp: int
-    signature: str
-
-# ============= Global State =============
 
 # Node identity (generated on startup)
 node_private_key: Optional[ed25519.Ed25519PrivateKey] = None
 node_public_key: Optional[ed25519.Ed25519PublicKey] = None
 node_id: str = ""
 
-# Connected peers
+# In-memory caches (backed by database)
 peers: Dict[str, APNPeerNode] = {}
-
-# Secure sessions
 secure_sessions: Dict[str, Dict[str, Any]] = {}
-
-# WebSocket connections
 websocket_connections: Dict[str, WebSocket] = {}
+peer_connections: Dict[str, Dict[str, Any]] = {}
+
+# Database instance
+db: Optional[APNDatabase] = None
+
+
+# ============= App Setup =============
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler for startup and shutdown"""
+    global db
+
+    settings = get_settings()
+    setup_logging(settings.log_level)
+
+    generate_node_identity()
+
+    # Initialize database
+    db = await get_database()
+    logger.info(f"Database initialized: {settings.full_database_path}")
+
+    # Load contribution settings from database
+    contribution = await db.get_setting("contribution_settings")
+    if contribution:
+        logger.info(f"Loaded contribution settings: enabled={contribution.get('enabled', False)}")
+
+    logger.info("")
+    logger.info("  =====================================================")
+    logger.info(f"            APN CORE v{APN_CORE_VERSION}")
+    logger.info("   Alpha Protocol Network - Sovereign Mesh Node")
+    logger.info("  =====================================================")
+    logger.info("")
+    logger.info(f"  Node ID: {node_id}")
+    logger.info(f"  NATS Relay: {settings.nats_relay}")
+    logger.info(f"  Nora Backend: {settings.nora_url}")
+    logger.info(f"  API Port: {settings.port}")
+    logger.info("")
+
+    # Start mesh peer connections in background
+    asyncio.create_task(connect_to_mesh_peers())
+
+    yield  # Server runs here
+
+    # Shutdown
+    logger.info("Shutting down APN CORE Server...")
+    await close_database()
+
+
+def create_app() -> FastAPI:
+    """Create and configure FastAPI application"""
+    settings = get_settings()
+
+    # Initialize rate limiter
+    limiter = Limiter(key_func=get_remote_address)
+
+    app = FastAPI(
+        title="APN CORE Server",
+        description="Alpha Protocol Network - Sovereign mesh networking for device contribution",
+        version=APN_CORE_VERSION,
+        lifespan=lifespan,
+    )
+
+    # Add rate limiter
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+    # Configure CORS with proper security
+    if settings.debug and "*" in settings.cors_origins:
+        logger.warning("CORS is configured with wildcard origin - NOT RECOMMENDED FOR PRODUCTION")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    return app
+
+
+app = create_app()
+
+
+# ============= Dependencies =============
+
+async def get_db() -> APNDatabase:
+    """Dependency to get database instance"""
+    global db
+    if db is None:
+        db = await get_database()
+    return db
+
+
+async def verify_api_key(
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> bool:
+    """Verify API key if configured"""
+    settings = get_settings()
+
+    # If no API key configured, allow all requests (development mode)
+    if not settings.api_key:
+        return True
+
+    if not x_api_key:
+        logger.warning("Request without API key rejected")
+        raise HTTPException(status_code=401, detail="API key required")
+
+    if x_api_key != settings.api_key:
+        logger.warning("Invalid API key rejected")
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    return True
+
 
 # ============= Initialization =============
 
-def generate_node_identity():
+def generate_node_identity() -> None:
     """Generate Ed25519 keypair for node identity"""
     global node_private_key, node_public_key, node_id
 
-    # Check for existing identity
-    identity_file = os.path.expanduser("~/.apn_bridge_identity.json")
-    if os.path.exists(identity_file):
+    settings = get_settings()
+    identity_file = settings.full_identity_path
+
+    if identity_file.exists():
         try:
             with open(identity_file, 'r') as f:
                 data = json.load(f)
@@ -142,10 +313,12 @@ def generate_node_identity():
             node_private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
             node_public_key = node_private_key.public_key()
             node_id = data['node_id']
-            print(f"Loaded identity: {node_id}")
+            logger.info(f"Loaded node identity: {node_id}")
             return
-        except Exception as e:
-            print(f"Failed to load identity: {e}")
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Failed to load identity from {identity_file}: {e}")
+        except IOError as e:
+            logger.error(f"Failed to read identity file: {e}")
 
     # Generate new identity
     node_private_key = ed25519.Ed25519PrivateKey.generate()
@@ -158,62 +331,116 @@ def generate_node_identity():
     # Save identity
     seed = get_private_bytes(node_private_key)
     try:
+        settings.ensure_config_dir()
         with open(identity_file, 'w') as f:
             json.dump({'seed': seed.hex(), 'node_id': node_id}, f)
-        print(f"Generated new identity: {node_id}")
-    except Exception as e:
-        print(f"Warning: Could not save identity: {e}")
+        identity_file.chmod(0o600)  # Secure file permissions
+        logger.info(f"Generated new node identity: {node_id}")
+    except IOError as e:
+        logger.error(f"Failed to save identity file: {e}")
 
-@app.on_event("startup")
-async def startup():
-    global contribution_settings
 
-    generate_node_identity()
-    print(f"")
-    print(f"  ╔═══════════════════════════════════════════════════╗")
-    print(f"  ║           APN Core v{APN_CORE_VERSION}                         ║")
-    print(f"  ║   Alpha Protocol Network - Sovereign Mesh Node    ║")
-    print(f"  ╚═══════════════════════════════════════════════════╝")
-    print(f"")
-    print(f"  Node ID: {node_id}")
-    print(f"  NATS Relay: {DEFAULT_NATS_RELAY}")
-    print(f"  Nora Backend: {NORA_URL}")
-    print(f"")
-
-    # Load contribution settings if exists
-    config_path = os.path.expanduser("~/.apn/contribution_settings.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r') as f:
-                contribution_settings = json.load(f)
-            print(f"  Loaded contribution settings: enabled={contribution_settings.get('enabled', False)}")
-        except Exception as e:
-            print(f"  Warning: Could not load contribution settings: {e}")
-
-    # Start mesh peer connections in background
-    asyncio.create_task(connect_to_mesh_peers())
-
-# ============= API Endpoints =============
+# ============= Health & Info Endpoints =============
 
 @app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {"status": "ok", "node_id": node_id}
+async def health(database: APNDatabase = Depends(get_db)):
+    """Health check endpoint with dependency status"""
+    settings = get_settings()
+
+    # Check database connectivity
+    db_healthy = True
+    try:
+        await database.get_setting("health_check")
+    except Exception:
+        db_healthy = False
+
+    return {
+        "status": "ok" if db_healthy else "degraded",
+        "node_id": node_id,
+        "version": APN_CORE_VERSION,
+        "protocol": APN_PROTOCOL_VERSION,
+        "components": {
+            "database": "healthy" if db_healthy else "unhealthy",
+            "mesh_peers": len(peer_connections),
+            "websocket_clients": len(websocket_connections),
+        }
+    }
+
+
+@app.get("/api/version")
+async def get_version():
+    """Get APN Core version information"""
+    settings = get_settings()
+    return {
+        "apn_core_version": APN_CORE_VERSION,
+        "protocol_version": APN_PROTOCOL_VERSION,
+        "node_id": node_id,
+        "nats_relay": settings.nats_relay,
+    }
+
+
+# ============= Peer Registration =============
 
 @app.post("/register")
-async def register_peer(registration: PeerRegistration):
-    """Register a peer node"""
+async def register_peer(
+    registration: PeerRegistration,
+    request: Request,
+    database: APNDatabase = Depends(get_db),
+):
+    """Register a peer node with optional signature verification"""
+    settings = get_settings()
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Verify signature if provided (recommended for production)
+    if registration.signature and registration.timestamp:
+        if not verify_peer_signature(registration):
+            logger.warning(f"Invalid signature from peer {registration.nodeId} at {client_ip}")
+            await database.log_audit_event(
+                "peer_registration",
+                peer_id=registration.nodeId,
+                details={"error": "invalid_signature"},
+                ip_address=client_ip,
+                success=False,
+            )
+            raise HTTPException(status_code=401, detail="Invalid signature")
+
+        # Check timestamp for replay protection (5 minute window)
+        now = int(datetime.now().timestamp())
+        if abs(now - registration.timestamp) > 300:
+            logger.warning(f"Stale registration from peer {registration.nodeId}")
+            raise HTTPException(status_code=401, detail="Registration timestamp too old")
+
+    # Save peer to database
+    capabilities = registration.settings.get('capabilities', {}) if registration.settings else {}
+    await database.save_peer(
+        node_id=registration.nodeId,
+        public_key=registration.publicKey,
+        roles=registration.roles or [],
+        capabilities=capabilities,
+        payment_address=registration.paymentAddress or "",
+    )
+
+    # Update in-memory cache
     peer = APNPeerNode(
         node_id=registration.nodeId,
         public_key=registration.publicKey,
         roles=registration.roles or [],
-        capabilities=registration.settings.get('capabilities', {}) if registration.settings else {},
+        capabilities=capabilities,
     )
     peers[registration.nodeId] = peer
 
-    print(f"Registered peer: {registration.nodeId}")
-    print(f"  Roles: {peer.roles}")
-    print(f"  Capabilities: {peer.capabilities}")
+    # Log audit event
+    await database.log_audit_event(
+        "peer_registration",
+        peer_id=registration.nodeId,
+        details={"roles": peer.roles, "capabilities": peer.capabilities},
+        ip_address=client_ip,
+        success=True,
+    )
+
+    logger.info(f"Registered peer: {registration.nodeId} from {client_ip}")
+    logger.debug(f"  Roles: {peer.roles}")
+    logger.debug(f"  Capabilities: {peer.capabilities}")
 
     return {
         "status": "registered",
@@ -221,10 +448,74 @@ async def register_peer(registration: PeerRegistration):
         "timestamp": datetime.now().isoformat(),
     }
 
-@app.post("/api/secure/handshake")
-async def secure_handshake(message: HandshakeMessage):
-    """Handle secure channel handshake"""
+
+def verify_peer_signature(registration: PeerRegistration) -> bool:
+    """Verify peer's Ed25519 signature on registration"""
     try:
+        # Reconstruct signed data
+        sign_data = json.dumps({
+            "nodeId": registration.nodeId,
+            "publicKey": registration.publicKey,
+            "timestamp": registration.timestamp,
+        }, sort_keys=True).encode()
+
+        # Load peer's public key
+        pub_key_bytes = bytes.fromhex(registration.publicKey)
+        public_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_key_bytes)
+
+        # Verify signature
+        signature = base64.b64decode(registration.signature)
+        public_key.verify(signature, sign_data)
+
+        return True
+    except (InvalidSignature, ValueError, TypeError) as e:
+        logger.debug(f"Signature verification failed: {e}")
+        return False
+
+
+# ============= Secure Channel =============
+
+@app.post("/api/secure/handshake")
+async def secure_handshake(
+    message: HandshakeMessage,
+    request: Request,
+    database: APNDatabase = Depends(get_db),
+):
+    """Handle secure channel handshake with signature verification"""
+    client_ip = request.client.host if request.client else "unknown"
+
+    try:
+        # Verify handshake signature
+        sign_data = json.dumps({
+            'ephemeral_key': message.ephemeral_key,
+            'node_id': message.node_id,
+            'public_key': message.public_key,
+            'timestamp': message.timestamp,
+            'type': message.type,
+        }, sort_keys=True).encode()
+
+        try:
+            pub_key_bytes = base64.b64decode(message.public_key)
+            peer_public_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_key_bytes)
+            signature = base64.b64decode(message.signature)
+            peer_public_key.verify(signature, sign_data)
+        except InvalidSignature:
+            logger.warning(f"Invalid handshake signature from {message.node_id}")
+            await database.log_audit_event(
+                "handshake_failed",
+                peer_id=message.node_id,
+                details={"error": "invalid_signature"},
+                ip_address=client_ip,
+                success=False,
+            )
+            raise HTTPException(status_code=401, detail="Invalid signature")
+
+        # Check timestamp (5 minute window for replay protection)
+        now = int(datetime.now().timestamp())
+        if abs(now - message.timestamp) > 300:
+            logger.warning(f"Stale handshake from {message.node_id}")
+            raise HTTPException(status_code=401, detail="Handshake timestamp too old")
+
         # Generate ephemeral X25519 key for this session
         ephemeral_private = x25519.X25519PrivateKey.generate()
         ephemeral_public = ephemeral_private.public_key()
@@ -252,7 +543,10 @@ async def secure_handshake(message: HandshakeMessage):
         recv_key = key_material[:32]
         send_key = key_material[32:64]
 
-        # Store session
+        # Store session in database
+        await database.save_session(message.node_id, send_key, recv_key)
+
+        # Update in-memory cache
         secure_sessions[message.node_id] = {
             'send_key': send_key,
             'recv_key': recv_key,
@@ -265,56 +559,85 @@ async def secure_handshake(message: HandshakeMessage):
         timestamp = int(datetime.now().timestamp())
 
         # Sign response
-        sign_data = json.dumps({
+        response_data = {
             'ephemeral_key': base64.b64encode(get_public_bytes(ephemeral_public)).decode(),
             'node_id': node_id,
             'public_key': base64.b64encode(get_public_bytes(node_public_key)).decode(),
             'timestamp': timestamp,
             'type': 'handshake_response',
-        }, sort_keys=True).encode()
-
+        }
+        sign_data = json.dumps(response_data, sort_keys=True).encode()
         signature = node_private_key.sign(sign_data)
 
-        print(f"Secure session established with {message.node_id}")
+        # Log audit event
+        await database.log_audit_event(
+            "handshake_success",
+            peer_id=message.node_id,
+            ip_address=client_ip,
+            success=True,
+        )
+
+        logger.info(f"Secure session established with {message.node_id}")
 
         return {
-            'type': 'handshake_response',
-            'node_id': node_id,
-            'public_key': base64.b64encode(get_public_bytes(node_public_key)).decode(),
-            'ephemeral_key': base64.b64encode(get_public_bytes(ephemeral_public)).decode(),
-            'timestamp': timestamp,
+            **response_data,
             'signature': base64.b64encode(signature).decode(),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Handshake error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Handshake error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=400, detail="Handshake failed")
+
 
 @app.post("/api/secure/message")
-async def secure_message(message: Dict[str, Any]):
+async def secure_message(
+    message: SecureMessage,
+    database: APNDatabase = Depends(get_db),
+):
     """Handle encrypted message from peer"""
-    try:
-        peer_id = message.get('from')
-        payload_b64 = message.get('payload')
+    peer_id = message.from_peer
 
-        if not peer_id or not payload_b64:
-            raise HTTPException(status_code=400, detail="Missing from or payload")
-
-        session = secure_sessions.get(peer_id)
-        if not session:
+    # Get session from cache or database
+    session = secure_sessions.get(peer_id)
+    if not session:
+        db_session = await database.get_session(peer_id)
+        if not db_session:
+            logger.warning(f"No session found for peer {peer_id}")
             raise HTTPException(status_code=400, detail="No session with peer")
+        session = {
+            'send_key': db_session['send_key'],
+            'recv_key': db_session['recv_key'],
+            'send_nonce': db_session['send_nonce'],
+            'recv_nonce': db_session['recv_nonce'],
+            'created_at': db_session['created_at'],
+        }
+        secure_sessions[peer_id] = session
 
+    try:
         # Decrypt
-        encrypted = base64.b64decode(payload_b64)
+        encrypted = base64.b64decode(message.payload)
+        if len(encrypted) < 28:  # 12 bytes nonce + 16 bytes tag minimum
+            raise ValueError("Payload too short")
+
         nonce = encrypted[:12]
-        ciphertext = encrypted[12:-16]
-        tag = encrypted[-16:]
+        ciphertext = encrypted[12:]
 
         cipher = ChaCha20Poly1305(session['recv_key'])
-        plaintext = cipher.decrypt(nonce, ciphertext + tag, None)
+        plaintext = cipher.decrypt(nonce, ciphertext, None)
+
+        # Validate and increment nonce
+        received_nonce = int.from_bytes(nonce, 'big')
+        if received_nonce < session['recv_nonce']:
+            logger.warning(f"Replay attack detected from {peer_id}: nonce {received_nonce} < {session['recv_nonce']}")
+            raise HTTPException(status_code=400, detail="Invalid nonce (replay detected)")
+
+        session['recv_nonce'] = received_nonce + 1
+        await database.update_session_nonce(peer_id, recv_nonce=session['recv_nonce'])
 
         data = json.loads(plaintext.decode())
-        print(f"Decrypted message from {peer_id}: {data.get('type', 'unknown')}")
+        logger.debug(f"Decrypted message from {peer_id}: {data.get('type', 'unknown')}")
 
         # Handle message based on type
         response_data = await handle_peer_message(peer_id, data)
@@ -325,6 +648,7 @@ async def secure_message(message: Dict[str, Any]):
 
             nonce_int = session['send_nonce']
             session['send_nonce'] += 1
+            await database.update_session_nonce(peer_id, send_nonce=session['send_nonce'])
 
             nonce_bytes = nonce_int.to_bytes(12, 'big')
             cipher = ChaCha20Poly1305(session['send_key'])
@@ -337,58 +661,66 @@ async def secure_message(message: Dict[str, Any]):
 
         return {'status': 'ok'}
 
+    except json.JSONDecodeError as e:
+        logger.warning(f"Invalid JSON in decrypted message from {peer_id}: {e}")
+        raise HTTPException(status_code=400, detail="Invalid message format")
     except Exception as e:
-        print(f"Secure message error: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Secure message error from {peer_id}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=400, detail="Message processing failed")
+
 
 async def handle_peer_message(peer_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Handle decrypted peer message"""
     msg_type = data.get('type')
 
     if msg_type == 'wearable_state':
-        print(f"Wearable state from {peer_id}: ring={data.get('ring_connected')}, glasses={data.get('glasses_connected')}")
+        logger.info(f"Wearable state from {peer_id}: ring={data.get('ring_connected')}, glasses={data.get('glasses_connected')}")
         return {'type': 'ack', 'status': 'received'}
 
     elif msg_type == 'button_event':
         event_type = data.get('event_type')
-        print(f"Button event from {peer_id}: {event_type}")
-        # Forward to Nora for processing
+        logger.info(f"Button event from {peer_id}: {event_type}")
         await forward_to_nora('button_event', data)
         return {'type': 'ack', 'status': 'processed'}
 
     elif msg_type == 'voice_command':
-        print(f"Voice command from {peer_id}: {data.get('text')}")
-        # Forward to Nora
+        logger.info(f"Voice command from {peer_id}: {data.get('text')}")
         response = await forward_to_nora('voice_command', data)
         return response
 
     return None
 
+
 async def forward_to_nora(event_type: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Forward event to Nora backend"""
+    settings = get_settings()
+
     try:
-        async with httpx.AsyncClient() as client:
-            # Try Nora's chat endpoint for voice commands
+        async with httpx.AsyncClient(timeout=30.0) as client:
             if event_type == 'voice_command':
                 response = await client.post(
-                    f"{NORA_URL}/api/chat",
+                    f"{settings.nora_url}/api/chat",
                     json={
                         'message': data.get('text', ''),
                         'context': {'source': 'wearable', 'peer_id': data.get('peer_id')},
                     },
-                    timeout=30.0,
                 )
                 if response.status_code == 200:
                     return response.json()
 
-            # Log button events
             elif event_type == 'button_event':
-                print(f"Button event forwarded: {data}")
+                logger.debug(f"Button event forwarded: {data}")
 
         return None
-    except Exception as e:
-        print(f"Error forwarding to Nora: {e}")
+    except httpx.TimeoutException:
+        logger.warning(f"Timeout forwarding {event_type} to Nora")
         return None
+    except httpx.RequestError as e:
+        logger.warning(f"Error forwarding to Nora: {type(e).__name__}: {e}")
+        return None
+
+
+# ============= WebSocket =============
 
 @app.websocket("/api/events/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -399,13 +731,19 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            message = json.loads(data)
+
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                logger.warning("Invalid JSON received on WebSocket")
+                await websocket.send_text(json.dumps({'type': 'error', 'message': 'Invalid JSON'}))
+                continue
 
             if message.get('type') == 'identify':
                 peer_id = message.get('node_id')
                 if peer_id:
                     websocket_connections[peer_id] = websocket
-                    print(f"WebSocket identified: {peer_id}")
+                    logger.info(f"WebSocket identified: {peer_id}")
                     await websocket.send_text(json.dumps({
                         'type': 'welcome',
                         'node_id': node_id,
@@ -417,59 +755,69 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         if peer_id and peer_id in websocket_connections:
             del websocket_connections[peer_id]
-        print(f"WebSocket disconnected: {peer_id}")
+        logger.info(f"WebSocket disconnected: {peer_id}")
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {type(e).__name__}: {e}")
+        if peer_id and peer_id in websocket_connections:
+            del websocket_connections[peer_id]
+
+
+# ============= Wearables =============
 
 @app.post("/api/wearables/state")
-async def wearable_state(state: Dict[str, Any]):
+async def wearable_state(state: WearableState):
     """Receive wearable state update"""
-    print(f"Wearable state update: {state}")
+    logger.info(f"Wearable state update: ring={state.ring_connected}, glasses={state.glasses_connected}")
     return {"status": "received"}
 
-# Local task storage
-local_tasks: List[Dict[str, Any]] = []
 
-class TaskCreate(BaseModel):
-    title: str
-    description: Optional[str] = ""
-    assigned_to: Optional[str] = ""
-    priority: Optional[str] = "medium"
-    status: Optional[str] = "pending"
-    due_date: Optional[str] = None
+@app.post("/api/wearables/button")
+async def wearable_button(event: Dict[str, Any]):
+    """Receive button event from wearable"""
+    event_type = event.get('event_type')
+    logger.info(f"Button event: {event_type}")
+    await forward_to_nora('button_event', event)
+    return {"status": "processed"}
+
+
+# ============= Tasks =============
 
 @app.get("/api/tasks")
-async def get_tasks(assigned_to: Optional[str] = None):
-    """Get tasks assigned to a node"""
+async def get_tasks(
+    assigned_to: Optional[str] = None,
+    status: Optional[str] = None,
+    database: APNDatabase = Depends(get_db),
+):
+    """Get tasks with optional filters"""
+    settings = get_settings()
+
     # Try to fetch tasks from Nora first
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(
-                f"{NORA_URL}/api/tasks",
+                f"{settings.nora_url}/api/tasks",
                 params={'assigned_to': assigned_to} if assigned_to else {},
-                timeout=5.0,
             )
             if response.status_code == 200:
                 nora_tasks = response.json()
-                # Merge with local tasks
+                # Get local tasks from database
+                local_tasks = await database.get_tasks(assigned_to=assigned_to, status=status)
                 all_tasks = nora_tasks.get('tasks', []) + local_tasks
-                if assigned_to:
-                    all_tasks = [t for t in all_tasks if t.get('assigned_to') == assigned_to]
                 return {"tasks": all_tasks, "source": "merged"}
-    except Exception as e:
-        print(f"Failed to fetch tasks from Nora: {e}")
+    except httpx.RequestError as e:
+        logger.debug(f"Nora unavailable for tasks: {e}")
 
-    # Return local tasks if Nora unavailable
-    tasks = local_tasks
-    if assigned_to:
-        tasks = [t for t in tasks if t.get('assigned_to') == assigned_to]
+    # Return local tasks from database
+    tasks = await database.get_tasks(assigned_to=assigned_to, status=status)
     return {"tasks": tasks, "source": "local"}
 
-@app.post("/api/tasks")
-async def create_task(task: TaskCreate):
-    """Create a new task"""
-    import uuid
 
+@app.post("/api/tasks")
+async def create_task(
+    task: TaskCreate,
+    database: APNDatabase = Depends(get_db),
+):
+    """Create a new task"""
     new_task = {
         "id": str(uuid.uuid4())[:8],
         "title": task.title,
@@ -478,60 +826,65 @@ async def create_task(task: TaskCreate):
         "priority": task.priority,
         "status": task.status,
         "due_date": task.due_date,
-        "created_at": datetime.now().isoformat(),
         "created_by": node_id,
     }
 
-    local_tasks.append(new_task)
-    print(f"Task created: {new_task['title']} (assigned to: {task.assigned_to})")
+    created_task = await database.create_task(new_task)
+    logger.info(f"Task created: {created_task['title']} (assigned to: {task.assigned_to})")
 
-    # Try to sync to mesh peers
+    # Sync to mesh peers
     for peer_url, peer_info in peer_connections.items():
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(
                     f"{peer_url}/api/tasks/sync",
-                    json=new_task,
-                    timeout=5.0,
+                    json=created_task,
                 )
-        except:
-            pass
+        except httpx.RequestError as e:
+            logger.debug(f"Failed to sync task to {peer_url}: {e}")
 
-    return {"status": "created", "task": new_task}
+    return {"status": "created", "task": created_task}
+
 
 @app.post("/api/tasks/sync")
-async def sync_task(task: Dict[str, Any]):
+async def sync_task(
+    task: Dict[str, Any],
+    request: Request,
+    database: APNDatabase = Depends(get_db),
+):
     """Receive synced task from mesh peer"""
-    # Check if task already exists
-    if not any(t.get('id') == task.get('id') for t in local_tasks):
-        local_tasks.append(task)
-        print(f"Task synced from mesh: {task.get('title')}")
-    return {"status": "synced"}
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Validate required fields
+    if not task.get('id') or not task.get('title'):
+        raise HTTPException(status_code=400, detail="Missing required task fields")
+
+    synced = await database.sync_task(task, synced_from=client_ip)
+
+    if synced:
+        logger.info(f"Task synced from mesh: {task.get('title')}")
+
+    return {"status": "synced" if synced else "duplicate"}
+
 
 @app.patch("/api/tasks/{task_id}")
-async def update_task(task_id: str, updates: Dict[str, Any]):
+async def update_task(
+    task_id: str,
+    updates: TaskUpdate,
+    database: APNDatabase = Depends(get_db),
+):
     """Update a task"""
-    for task in local_tasks:
-        if task.get('id') == task_id:
-            task.update(updates)
-            task['updated_at'] = datetime.now().isoformat()
-            print(f"Task updated: {task_id}")
-            return {"status": "updated", "task": task}
+    update_dict = updates.model_dump(exclude_unset=True)
+    updated_task = await database.update_task(task_id, update_dict)
 
-    raise HTTPException(status_code=404, detail="Task not found")
+    if not updated_task:
+        raise HTTPException(status_code=404, detail="Task not found")
 
-@app.post("/api/wearables/button")
-async def wearable_button(event: Dict[str, Any]):
-    """Receive button event from wearable"""
-    event_type = event.get('event_type')
-    print(f"Button event: {event_type}")
+    logger.info(f"Task updated: {task_id}")
+    return {"status": "updated", "task": updated_task}
 
-    # Forward to Nora
-    await forward_to_nora('button_event', event)
 
-    return {"status": "processed"}
-
-# ============= System Resources & Device Contribution =============
+# ============= System Resources & Contribution =============
 
 def get_system_resources() -> Dict[str, Any]:
     """Get system resource information for device contribution"""
@@ -564,59 +917,39 @@ def get_system_resources() -> Dict[str, Any]:
     }
 
     if PSUTIL_AVAILABLE:
-        # CPU usage
         resources["cpu"]["usage_percent"] = psutil.cpu_percent(interval=0.1)
 
-        # Memory
         mem = psutil.virtual_memory()
         resources["memory"]["total_gb"] = round(mem.total / (1024**3), 2)
         resources["memory"]["available_gb"] = round(mem.available / (1024**3), 2)
         resources["memory"]["used_percent"] = mem.percent
 
-        # Storage (root partition)
         try:
             disk = psutil.disk_usage('/')
             resources["storage"]["total_gb"] = round(disk.total / (1024**3), 2)
             resources["storage"]["available_gb"] = round(disk.free / (1024**3), 2)
             resources["storage"]["used_percent"] = disk.percent
-        except:
-            pass
+        except OSError as e:
+            logger.debug(f"Could not get disk usage: {e}")
 
-    # Try to detect GPU (basic detection)
+    # Try to detect GPU
     try:
         import subprocess
-        result = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'],
-                              capture_output=True, text=True, timeout=5)
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5
+        )
         if result.returncode == 0:
             parts = result.stdout.strip().split(',')
             if len(parts) >= 2:
                 resources["gpu"]["available"] = True
                 resources["gpu"]["name"] = parts[0].strip()
                 resources["gpu"]["memory_gb"] = round(int(parts[1].strip()) / 1024, 2)
-    except:
-        pass
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError) as e:
+        logger.debug(f"GPU detection failed: {e}")
 
     return resources
 
-# Device contribution settings (stored in memory, persisted to config)
-contribution_settings: Dict[str, Any] = {
-    "enabled": False,
-    "relay": False,
-    "compute": False,
-    "storage": False,
-    "storage_gb_allocated": 10,
-    "compute_cores_allocated": 1,
-    "bandwidth_limit_mbps": 100,
-}
-
-class ContributionSettings(BaseModel):
-    enabled: bool = False
-    relay: bool = False
-    compute: bool = False
-    storage: bool = False
-    storage_gb_allocated: int = 10
-    compute_cores_allocated: int = 1
-    bandwidth_limit_mbps: int = 100
 
 @app.get("/api/resources")
 async def get_resources():
@@ -628,39 +961,470 @@ async def get_resources():
         "protocol_version": APN_PROTOCOL_VERSION,
     }
 
+
 @app.get("/api/contribution/status")
-async def get_contribution_status():
+async def get_contribution_status(database: APNDatabase = Depends(get_db)):
     """Get current device contribution status"""
+    settings = get_settings()
+    contribution = await database.get_setting("contribution_settings") or settings.get_contribution_settings()
     resources = get_system_resources()
+
     return {
         "node_id": node_id,
-        "settings": contribution_settings,
+        "settings": contribution,
         "resources": resources,
         "mesh_peers": len(peer_connections),
-        "relay_url": DEFAULT_NATS_RELAY,
-        "status": "contributing" if contribution_settings["enabled"] else "idle",
+        "relay_url": settings.nats_relay,
+        "status": "contributing" if contribution.get("enabled") else "idle",
     }
 
+
 @app.post("/api/contribution/settings")
-async def update_contribution_settings(settings: ContributionSettings):
+async def update_contribution_settings(
+    settings_update: ContributionSettings,
+    database: APNDatabase = Depends(get_db),
+):
     """Update device contribution settings"""
-    global contribution_settings
-    contribution_settings = settings.model_dump()
+    contribution = settings_update.model_dump()
 
-    print(f"Contribution settings updated: enabled={settings.enabled}")
-    print(f"  Relay: {settings.relay}, Compute: {settings.compute}, Storage: {settings.storage}")
+    # Save to database
+    await database.save_setting("contribution_settings", contribution)
 
-    # Save to config file
-    config_path = os.path.expanduser("~/.apn/contribution_settings.json")
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    with open(config_path, 'w') as f:
-        json.dump(contribution_settings, f, indent=2)
+    logger.info(f"Contribution settings updated: enabled={settings_update.enabled}")
+    logger.debug(f"  Relay: {settings_update.relay}, Compute: {settings_update.compute}, Storage: {settings_update.storage}")
 
-    return {"status": "updated", "settings": contribution_settings}
+    return {"status": "updated", "settings": contribution}
+
+
+# ============= Mesh Peering =============
+
+async def connect_to_mesh_peers():
+    """Connect to known APN peers for mesh networking"""
+    settings = get_settings()
+    await asyncio.sleep(2)  # Wait for server to fully start
+
+    for peer_url in settings.known_peers:
+        asyncio.create_task(connect_to_peer(peer_url))
+
+
+async def connect_to_peer(peer_url: str):
+    """Establish connection with a mesh peer"""
+    settings = get_settings()
+    database = await get_database()
+
+    try:
+        logger.info(f"Attempting mesh connection to: {peer_url}")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Check if peer is online
+            try:
+                response = await client.get(f"{peer_url}/health")
+                if response.status_code != 200:
+                    logger.warning(f"Peer {peer_url} not healthy: {response.status_code}")
+                    await schedule_peer_retry(peer_url)
+                    return
+            except httpx.RequestError as e:
+                logger.warning(f"Peer {peer_url} unreachable: {e}")
+                await schedule_peer_retry(peer_url)
+                return
+
+            # Get peer info
+            peer_node_id = None
+            try:
+                health_data = response.json()
+                peer_node_id = health_data.get('node_id', 'unknown')
+            except json.JSONDecodeError:
+                pass
+
+            # Register ourselves with the peer
+            pub_bytes = get_public_bytes(node_public_key)
+            registration = {
+                'nodeId': node_id,
+                'publicKey': pub_bytes.hex(),
+                'paymentAddress': '',
+                'roles': ['sovereign_node', 'wearable_hub'],
+                'settings': {
+                    'capabilities': {
+                        'mesh_relay': True,
+                        'wearables': True,
+                    },
+                    'device_name': 'Sovereign Stack Node',
+                }
+            }
+
+            try:
+                reg_response = await client.post(
+                    f"{peer_url}/register",
+                    json=registration,
+                )
+
+                if reg_response.status_code == 200:
+                    reg_data = reg_response.json()
+                    peer_node_id = reg_data.get('dashboard_node_id', peer_node_id)
+
+                    peer_connections[peer_url] = {
+                        'node_id': peer_node_id,
+                        'status': 'connected',
+                        'connected_at': datetime.now().isoformat(),
+                        'url': peer_url,
+                    }
+
+                    # Save to database
+                    await database.save_peer_connection(peer_url, peer_node_id, "connected")
+
+                    logger.info(f"Mesh connected to peer: {peer_node_id} at {peer_url}")
+
+                    # Start keep-alive
+                    asyncio.create_task(peer_keepalive(peer_url))
+                else:
+                    logger.warning(f"Peer registration failed: {reg_response.status_code}")
+                    await schedule_peer_retry(peer_url)
+
+            except httpx.RequestError as e:
+                logger.warning(f"Peer registration error: {e}")
+                await schedule_peer_retry(peer_url)
+
+    except Exception as e:
+        logger.error(f"Mesh connection error for {peer_url}: {type(e).__name__}: {e}")
+        await schedule_peer_retry(peer_url)
+
+
+async def peer_keepalive(peer_url: str):
+    """Send periodic keepalives to mesh peer"""
+    database = await get_database()
+
+    while peer_url in peer_connections:
+        await asyncio.sleep(30)
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{peer_url}/health")
+                if response.status_code != 200:
+                    logger.warning(f"Peer {peer_url} health check failed")
+                    del peer_connections[peer_url]
+                    await database.update_peer_connection_status(peer_url, "disconnected")
+                    await schedule_peer_retry(peer_url)
+                    return
+                else:
+                    await database.update_peer_connection_status(peer_url, "connected")
+
+        except httpx.RequestError as e:
+            logger.warning(f"Peer keepalive failed for {peer_url}: {e}")
+            if peer_url in peer_connections:
+                del peer_connections[peer_url]
+            await database.update_peer_connection_status(peer_url, "disconnected", increment_retry=True)
+            await schedule_peer_retry(peer_url)
+            return
+
+
+async def schedule_peer_retry(peer_url: str):
+    """Schedule retry connection to peer"""
+    async def retry():
+        await asyncio.sleep(30)
+        await connect_to_peer(peer_url)
+
+    asyncio.create_task(retry())
+
+
+@app.get("/api/mesh/peers")
+async def get_mesh_peers(database: APNDatabase = Depends(get_db)):
+    """Get list of connected mesh peers"""
+    settings = get_settings()
+
+    return {
+        'node_id': node_id,
+        'peers': list(peer_connections.values()),
+        'known_peers': settings.known_peers,
+    }
+
+
+@app.post("/api/mesh/message")
+async def mesh_message(message: MeshMessage):
+    """Forward a message to the mesh network"""
+    dest_node = message.dest_node
+    payload = message.payload
+
+    # Find peer that can reach destination
+    for peer_url, peer_info in peer_connections.items():
+        if peer_info.get('node_id') == dest_node or dest_node == 'broadcast':
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.post(
+                        f"{peer_url}/api/mesh/relay",
+                        json={
+                            'source_node': node_id,
+                            'dest_node': dest_node,
+                            'payload': payload,
+                            'hop_count': message.hop_count + 1,
+                        },
+                    )
+                    if response.status_code == 200:
+                        return {'status': 'relayed', 'via': peer_info.get('node_id')}
+            except httpx.RequestError as e:
+                logger.warning(f"Mesh relay failed: {e}")
+
+    return {'status': 'no_route', 'dest_node': dest_node}
+
+
+@app.post("/api/mesh/relay")
+async def mesh_relay(message: Dict[str, Any]):
+    """Handle relayed mesh message"""
+    source_node = message.get('source_node')
+    dest_node = message.get('dest_node')
+    payload = message.get('payload')
+    hop_count = message.get('hop_count', 0)
+
+    if not source_node or not payload:
+        raise HTTPException(status_code=400, detail="Missing required fields")
+
+    logger.info(f"Mesh relay from {source_node}: {payload.get('type', 'unknown')} (hops: {hop_count})")
+
+    # If broadcast or destined for us, process locally
+    if dest_node == 'broadcast' or dest_node == node_id:
+        await handle_mesh_payload(source_node, payload)
+
+    # Forward to local wearables if applicable
+    for ws in websocket_connections.values():
+        try:
+            await ws.send_text(json.dumps({
+                'type': 'mesh_message',
+                'source': source_node,
+                'data': payload,
+            }))
+        except Exception as e:
+            logger.debug(f"Failed to forward to WebSocket: {e}")
+
+    return {'status': 'received'}
+
+
+# ============= PCG Dashboard Bridge =============
+
+class PCGTaskDistribution(BaseModel):
+    """Task distribution request from PCG Dashboard"""
+    task_id: str = Field(..., description="UUID of the task")
+    task_attempt_id: str = Field(..., description="UUID of the task attempt")
+    executor_profile: str = Field(..., description="Executor profile name")
+    prompt: str = Field(..., description="Task prompt")
+    project_id: str = Field(..., description="Project UUID")
+    project_path: Optional[str] = None
+    resource_requirements: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    reward_vibe: float = Field(default=10.0, ge=0)
+
+
+class PCGExecutionUpdate(BaseModel):
+    """Execution update from remote node"""
+    task_id: str
+    execution_process_id: str
+    stage: str = Field(..., pattern="^(setup|coding|testing|review|cleanup|completed|failed)$")
+    progress_percent: int = Field(ge=0, le=100)
+    current_action: str = ""
+    files_modified: int = 0
+    error: Optional[str] = None
+
+
+@app.post("/api/pcg/distribute")
+async def pcg_distribute_task(
+    distribution: PCGTaskDistribution,
+    request: Request,
+    database: APNDatabase = Depends(get_db),
+):
+    """
+    Receive task distribution request from PCG Dashboard.
+    Finds capable peers and assigns the task.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info(f"PCG task distribution from {client_ip}: {distribution.task_id}")
+
+    # Find capable peers based on requirements
+    capable_peers = []
+    for peer_url, peer_info in peer_connections.items():
+        if peer_info.get('status') == 'connected':
+            capable_peers.append({
+                'node_id': peer_info.get('node_id'),
+                'url': peer_url,
+            })
+
+    # If no remote peers, assign to local
+    if not capable_peers:
+        assigned_node = node_id
+        logger.info(f"No remote peers available, assigning task {distribution.task_id} locally")
+    else:
+        # Select first available peer (in production, use reputation/latency scoring)
+        assigned_peer = capable_peers[0]
+        assigned_node = assigned_peer['node_id']
+
+        # Forward task to assigned peer
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(
+                    f"{assigned_peer['url']}/api/pcg/execute",
+                    json={
+                        'task_id': distribution.task_id,
+                        'task_attempt_id': distribution.task_attempt_id,
+                        'executor_profile': distribution.executor_profile,
+                        'prompt': distribution.prompt,
+                        'project_id': distribution.project_id,
+                        'project_path': distribution.project_path,
+                        'reward_vibe': distribution.reward_vibe,
+                        'from_node': node_id,
+                    }
+                )
+        except httpx.RequestError as e:
+            logger.warning(f"Failed to forward task to {assigned_node}: {e}")
+            assigned_node = node_id  # Fall back to local
+
+    # Record audit
+    await database.log_audit_event(
+        "pcg_task_distributed",
+        peer_id=assigned_node,
+        details={
+            "task_id": distribution.task_id,
+            "executor_profile": distribution.executor_profile,
+            "reward_vibe": distribution.reward_vibe,
+        },
+        ip_address=client_ip,
+        success=True,
+    )
+
+    return {
+        'status': 'distributed',
+        'task_id': distribution.task_id,
+        'assigned_node': assigned_node,
+        'timestamp': datetime.now().isoformat(),
+    }
+
+
+@app.post("/api/pcg/execute")
+async def pcg_execute_task(
+    task: Dict[str, Any],
+    request: Request,
+):
+    """
+    Receive task execution request from another APN node.
+    This node will execute the task and stream results back.
+    """
+    task_id = task.get('task_id')
+    from_node = task.get('from_node')
+
+    logger.info(f"Received task execution request {task_id} from {from_node}")
+
+    # Broadcast to WebSocket clients that a task is available
+    for ws in websocket_connections.values():
+        try:
+            await ws.send_text(json.dumps({
+                'type': 'task_received',
+                'task_id': task_id,
+                'from_node': from_node,
+                'executor_profile': task.get('executor_profile'),
+                'prompt': task.get('prompt', '')[:200],  # Preview
+                'reward_vibe': task.get('reward_vibe', 0),
+            }))
+        except Exception as e:
+            logger.debug(f"Failed to notify WebSocket: {e}")
+
+    return {
+        'status': 'accepted',
+        'task_id': task_id,
+        'executor_node': node_id,
+    }
+
+
+@app.post("/api/pcg/execution/update")
+async def pcg_execution_update(
+    update: PCGExecutionUpdate,
+    request: Request,
+):
+    """
+    Receive execution progress update.
+    Forward to WebSocket clients and other interested parties.
+    """
+    logger.info(f"Execution update for {update.task_id}: {update.stage} ({update.progress_percent}%)")
+
+    # Broadcast to WebSocket clients
+    for ws in websocket_connections.values():
+        try:
+            await ws.send_text(json.dumps({
+                'type': 'execution_progress',
+                'task_id': update.task_id,
+                'execution_process_id': update.execution_process_id,
+                'stage': update.stage,
+                'progress_percent': update.progress_percent,
+                'current_action': update.current_action,
+                'files_modified': update.files_modified,
+            }))
+        except Exception as e:
+            logger.debug(f"Failed to broadcast execution update: {e}")
+
+    return {'status': 'received'}
+
+
+@app.post("/api/pcg/execution/log")
+async def pcg_execution_log(
+    log: Dict[str, Any],
+    request: Request,
+):
+    """
+    Receive execution log chunk.
+    Forward to WebSocket clients for real-time display.
+    """
+    task_id = log.get('task_id')
+    execution_id = log.get('execution_process_id')
+    log_type = log.get('log_type', 'system')
+    content = log.get('content', '')
+
+    # Broadcast to WebSocket clients
+    for ws in websocket_connections.values():
+        try:
+            await ws.send_text(json.dumps({
+                'type': 'execution_log',
+                'task_id': task_id,
+                'execution_process_id': execution_id,
+                'log_type': log_type,
+                'content': content,
+                'timestamp': datetime.now().isoformat(),
+            }))
+        except Exception as e:
+            logger.debug(f"Failed to broadcast log: {e}")
+
+    return {'status': 'received'}
+
+
+@app.get("/api/pcg/status")
+async def pcg_bridge_status():
+    """Get PCG bridge connection status"""
+    return {
+        'node_id': node_id,
+        'connected_peers': len(peer_connections),
+        'active_websockets': len(websocket_connections),
+        'nats_relay': get_settings().nats_relay,
+        'bridge_version': '1.0.0',
+        'capabilities': ['task_distribution', 'execution_relay', 'log_streaming'],
+    }
+
+
+async def handle_mesh_payload(source_node: str, payload: Dict[str, Any]):
+    """Handle mesh message payload locally"""
+    msg_type = payload.get('type')
+
+    if msg_type == 'ping':
+        logger.info(f"Mesh ping from {source_node}")
+    elif msg_type == 'task_assignment':
+        logger.info(f"Task assignment from {source_node}: {payload.get('task')}")
+        for ws in websocket_connections.values():
+            try:
+                await ws.send_text(json.dumps({
+                    'type': 'task',
+                    'data': payload.get('task'),
+                }))
+            except Exception as e:
+                logger.debug(f"Failed to forward task to WebSocket: {e}")
+
+
+# ============= Landing Page =============
 
 @app.get("/")
 async def landing_page():
-    """APN Core landing page"""
+    """APN CORE landing page"""
     resources = get_system_resources()
     peers_count = len(peer_connections)
 
@@ -668,7 +1432,7 @@ async def landing_page():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>APN Core - Alpha Protocol Network</title>
+        <title>APN CORE - Alpha Protocol Network</title>
         <meta charset="utf-8">
         <style>
             body {{
@@ -703,8 +1467,8 @@ async def landing_page():
     <body>
         <div class="container">
             <div class="header">
-                <div class="logo">Α</div>
-                <h1>APN Core</h1>
+                <div class="logo">A</div>
+                <h1>APN CORE</h1>
                 <p>Alpha Protocol Network - Sovereign Mesh Node</p>
                 <p class="version">v{APN_CORE_VERSION} | Protocol: {APN_PROTOCOL_VERSION}</p>
             </div>
@@ -717,7 +1481,7 @@ async def landing_page():
                         <div class="stat-label">Node ID</div>
                     </div>
                     <div class="stat">
-                        <div class="stat-value class="online">Online</div>
+                        <div class="stat-value online">Online</div>
                         <div class="stat-label">Status</div>
                     </div>
                     <div class="stat">
@@ -765,215 +1529,14 @@ async def landing_page():
     """
     return HTMLResponse(content=html)
 
-@app.get("/api/version")
-async def get_version():
-    """Get APN Core version information"""
-    return {
-        "apn_core_version": APN_CORE_VERSION,
-        "protocol_version": APN_PROTOCOL_VERSION,
-        "node_id": node_id,
-        "nats_relay": DEFAULT_NATS_RELAY,
-    }
-
-# ============= Mesh Peering =============
-
-async def connect_to_mesh_peers():
-    """Connect to known APN peers for mesh networking"""
-    await asyncio.sleep(2)  # Wait for server to fully start
-
-    for peer_url in KNOWN_PEERS:
-        asyncio.create_task(connect_to_peer(peer_url))
-
-async def connect_to_peer(peer_url: str):
-    """Establish connection with a mesh peer"""
-    try:
-        print(f"Attempting mesh connection to: {peer_url}")
-
-        # Check if peer is online
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.get(f"{peer_url}/health", timeout=5.0)
-                if response.status_code != 200:
-                    print(f"Peer {peer_url} not healthy: {response.status_code}")
-                    schedule_peer_retry(peer_url)
-                    return
-            except Exception as e:
-                print(f"Peer {peer_url} unreachable: {e}")
-                schedule_peer_retry(peer_url)
-                return
-
-            # Get peer info
-            peer_node_id = None
-            try:
-                health_data = response.json()
-                peer_node_id = health_data.get('node_id', 'unknown')
-            except:
-                pass
-
-            # Register ourselves with the peer
-            pub_bytes = get_public_bytes(node_public_key)
-            registration = {
-                'nodeId': node_id,
-                'publicKey': pub_bytes.hex(),
-                'paymentAddress': '',
-                'roles': ['sovereign_node', 'wearable_hub'],
-                'settings': {
-                    'capabilities': {
-                        'mesh_relay': True,
-                        'wearables': True,
-                    },
-                    'device_name': 'Sovereign Stack Node',
-                }
-            }
-
-            try:
-                reg_response = await client.post(
-                    f"{peer_url}/register",
-                    json=registration,
-                    timeout=10.0,
-                )
-
-                if reg_response.status_code == 200:
-                    reg_data = reg_response.json()
-                    peer_node_id = reg_data.get('dashboard_node_id', peer_node_id)
-
-                    peer_connections[peer_url] = {
-                        'node_id': peer_node_id,
-                        'status': 'connected',
-                        'connected_at': datetime.now().isoformat(),
-                        'url': peer_url,
-                    }
-
-                    print(f"Mesh connected to peer: {peer_node_id} at {peer_url}")
-
-                    # Start keep-alive
-                    asyncio.create_task(peer_keepalive(peer_url))
-                else:
-                    print(f"Peer registration failed: {reg_response.status_code}")
-                    schedule_peer_retry(peer_url)
-
-            except Exception as e:
-                print(f"Peer registration error: {e}")
-                schedule_peer_retry(peer_url)
-
-    except Exception as e:
-        print(f"Mesh connection error for {peer_url}: {e}")
-        schedule_peer_retry(peer_url)
-
-async def peer_keepalive(peer_url: str):
-    """Send periodic keepalives to mesh peer"""
-    while peer_url in peer_connections:
-        await asyncio.sleep(30)
-
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(f"{peer_url}/health", timeout=5.0)
-                if response.status_code != 200:
-                    print(f"Peer {peer_url} health check failed")
-                    del peer_connections[peer_url]
-                    schedule_peer_retry(peer_url)
-                    return
-        except Exception as e:
-            print(f"Peer keepalive failed for {peer_url}: {e}")
-            if peer_url in peer_connections:
-                del peer_connections[peer_url]
-            schedule_peer_retry(peer_url)
-            return
-
-def schedule_peer_retry(peer_url: str):
-    """Schedule retry connection to peer"""
-    async def retry():
-        await asyncio.sleep(30)  # Wait 30 seconds before retry
-        await connect_to_peer(peer_url)
-
-    asyncio.create_task(retry())
-
-@app.get("/api/mesh/peers")
-async def get_mesh_peers():
-    """Get list of connected mesh peers"""
-    return {
-        'node_id': node_id,
-        'peers': list(peer_connections.values()),
-        'known_peers': KNOWN_PEERS,
-    }
-
-@app.post("/api/mesh/message")
-async def mesh_message(message: Dict[str, Any]):
-    """Forward a message to the mesh network"""
-    dest_node = message.get('dest_node')
-    payload = message.get('payload')
-
-    if not dest_node or not payload:
-        raise HTTPException(status_code=400, detail="Missing dest_node or payload")
-
-    # Find peer that can reach destination
-    for peer_url, peer_info in peer_connections.items():
-        if peer_info.get('node_id') == dest_node or dest_node == 'broadcast':
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(
-                        f"{peer_url}/api/mesh/relay",
-                        json={
-                            'source_node': node_id,
-                            'dest_node': dest_node,
-                            'payload': payload,
-                            'hop_count': message.get('hop_count', 0) + 1,
-                        },
-                        timeout=10.0,
-                    )
-                    if response.status_code == 200:
-                        return {'status': 'relayed', 'via': peer_info.get('node_id')}
-            except Exception as e:
-                print(f"Mesh relay failed: {e}")
-
-    return {'status': 'no_route', 'dest_node': dest_node}
-
-@app.post("/api/mesh/relay")
-async def mesh_relay(message: Dict[str, Any]):
-    """Handle relayed mesh message"""
-    source_node = message.get('source_node')
-    dest_node = message.get('dest_node')
-    payload = message.get('payload')
-    hop_count = message.get('hop_count', 0)
-
-    print(f"Mesh relay from {source_node}: {payload.get('type', 'unknown')} (hops: {hop_count})")
-
-    # If broadcast or destined for us, process locally
-    if dest_node == 'broadcast' or dest_node == node_id:
-        await handle_mesh_payload(source_node, payload)
-
-    # Forward to local wearables if applicable
-    for ws in websocket_connections.values():
-        try:
-            await ws.send_text(json.dumps({
-                'type': 'mesh_message',
-                'source': source_node,
-                'data': payload,
-            }))
-        except:
-            pass
-
-    return {'status': 'received'}
-
-async def handle_mesh_payload(source_node: str, payload: Dict[str, Any]):
-    """Handle mesh message payload locally"""
-    msg_type = payload.get('type')
-
-    if msg_type == 'ping':
-        print(f"Mesh ping from {source_node}")
-    elif msg_type == 'task_assignment':
-        print(f"Task assignment from {source_node}: {payload.get('task')}")
-        # Forward to connected wearables
-        for ws in websocket_connections.values():
-            try:
-                await ws.send_text(json.dumps({
-                    'type': 'task',
-                    'data': payload.get('task'),
-                }))
-            except:
-                pass
 
 # ============= Main =============
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    settings = get_settings()
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level.lower(),
+    )

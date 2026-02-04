@@ -1,11 +1,11 @@
 #!/bin/bash
 # APN Core v1.0.0 - Android Bridge Setup
-# Sets up USB connection between Android device and APN Core Dashboard
+# Sets up USB connection between Android device and APN CORE
 
 set -e
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║          APN Core v1.0.0 - Android Bridge Setup              ║"
+echo "║           APN CORE v1.0.0 - Android Bridge Setup              ║"
 echo "║     Alpha Protocol Network - Sovereign Mesh Networking       ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
@@ -129,12 +129,12 @@ test_connection() {
 print_instructions() {
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
-    echo -e "${GREEN}APN Core Setup Complete!${NC}"
+    echo -e "${GREEN}APN CORE Setup Complete!${NC}"
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
     echo "Next steps:"
-    echo "  1. Start the APN Core Dashboard:"
-    echo "     cd alpha-dashboard && python main.py"
+    echo "  1. Start APN CORE:"
+    echo "     cd apn-core && python main.py"
     echo ""
     echo "  2. Open the Wearables Companion app on your phone"
     echo ""
@@ -143,7 +143,7 @@ print_instructions() {
     echo ""
     echo "  4. Connect your ring and glasses in the app"
     echo ""
-    echo "  5. Events will flow through USB to the APN Core Dashboard!"
+    echo "  5. Events will flow through USB to APN CORE!"
     echo ""
     echo "  6. Enable device contribution in the Node Config page"
     echo "     to start earning rewards on the mesh network!"

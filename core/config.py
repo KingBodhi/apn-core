@@ -1,8 +1,8 @@
 """
-APN Core - Configuration Management
+APN CORE - Configuration Management
 Centralized configuration system with proper validation and defaults.
 
-Part of the Alpha Protocol Network (APN Core v1.0.0)
+Part of APN CORE v1.0.0 - Alpha Protocol Network
 """
 import json
 import logging

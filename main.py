@@ -1,5 +1,5 @@
 """
-APN Core Dashboard - Main Application Entry Point
+APN CORE - Main Application Entry Point
 Alpha Protocol Network GUI with integrated mesh networking.
 
 Version: 1.0.0
@@ -53,7 +53,7 @@ def main():
 
     # Setup logging
     logger = setup_logging("INFO")
-    logger.info(f"Starting APN Core Dashboard v{APN_CORE_VERSION}")
+    logger.info(f"Starting APN CORE v{APN_CORE_VERSION}")
     logger.info("Alpha Protocol Network - Sovereign Mesh Node")
 
     try:
@@ -73,7 +73,7 @@ def main():
         # Start PyQt UI
         app = QApplication(sys.argv)
         window = MainWindow(config)
-        window.setWindowTitle(f"APN Core Dashboard v{APN_CORE_VERSION}")
+        window.setWindowTitle(f"APN CORE v{APN_CORE_VERSION}")
         window.show()
 
         # Start services after window is shown (like original)

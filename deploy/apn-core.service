@@ -1,0 +1,61 @@
+# APN Core Server - Systemd Service File
+# Install: sudo cp apn-core.service /etc/systemd/system/
+# Enable: sudo systemctl enable apn-core
+# Start: sudo systemctl start apn-core
+
+[Unit]
+Description=APN Core Server - Alpha Protocol Network
+Documentation=https://github.com/powerclubglobal/apn-core
+After=network.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=apn
+Group=apn
+WorkingDirectory=/opt/apn-core
+Environment="PATH=/opt/apn-core/venv/bin:/usr/local/bin:/usr/bin"
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-/opt/apn-core/.env
+
+# Start command
+ExecStart=/opt/apn-core/venv/bin/python apn_server.py
+
+# Graceful shutdown
+ExecStop=/bin/kill -SIGTERM $MAINPID
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/apn-core /home/apn/.apn
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apn-core
+
+[Install]
+WantedBy=multi-user.target

@@ -1,9 +1,9 @@
 """
-Alpha Protocol Network - Modern Dark Theme with Holographic Effects
+APN CORE - Modern Dark Theme with Holographic Effects
 """
 
 class APNTheme:
-    """Modern dark theme with holographic effects for APN Dashboard"""
+    """Modern dark theme with holographic effects for APN CORE"""
     
     # Color Palette
     COLORS = {
