@@ -513,15 +513,23 @@ rsn_pairwise=CCMP
             except Exception:
                 self.gpu_label.setText("No GPU detected")
 
-            # Try to get mesh peer count from local APN server
+            # Try to get mesh peer count from Pythia Master API
             if HTTPX_AVAILABLE:
                 try:
+                    # First try Pythia Master for network-wide view
                     with httpx.Client(timeout=2.0) as client:
-                        response = client.get("http://127.0.0.1:8000/api/mesh/peers")
+                        response = client.get("http://192.168.1.77:8081/api/status")
                         if response.status_code == 200:
                             data = response.json()
                             peer_count = len(data.get('peers', []))
-                            self.mesh_peers_label.setText(f"Peers: {peer_count}")
+                            self.mesh_peers_label.setText(f"Network Peers: {peer_count}")
+                        else:
+                            # Fallback to local API
+                            response = client.get("http://127.0.0.1:8000/api/mesh/peers")
+                            if response.status_code == 200:
+                                data = response.json()
+                                peer_count = len(data.get('peers', []))
+                                self.mesh_peers_label.setText(f"Local Peers: {peer_count}")
                 except Exception:
                     self.mesh_peers_label.setText("Peers: ?")
 
