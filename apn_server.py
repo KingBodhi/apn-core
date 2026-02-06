@@ -176,6 +176,7 @@ class APNPeerNode:
 node_private_key: Optional[ed25519.Ed25519PrivateKey] = None
 node_public_key: Optional[ed25519.Ed25519PublicKey] = None
 node_id: str = ""
+payment_address: str = ""  # Wallet address derived from public key
 
 # In-memory caches (backed by database)
 peers: Dict[str, APNPeerNode] = {}
@@ -215,6 +216,7 @@ async def lifespan(app: FastAPI):
     logger.info("  =====================================================")
     logger.info("")
     logger.info(f"  Node ID: {node_id}")
+    logger.info(f"  Wallet Address: {payment_address}")
     logger.info(f"  NATS Relay: {settings.nats_relay}")
     logger.info(f"  Nora Backend: {settings.nora_url}")
     logger.info(f"  API Port: {settings.port}")
@@ -325,8 +327,8 @@ async def verify_api_key(
 # ============= Initialization =============
 
 def generate_node_identity() -> None:
-    """Generate Ed25519 keypair for node identity"""
-    global node_private_key, node_public_key, node_id
+    """Generate Ed25519 keypair for node identity and wallet address"""
+    global node_private_key, node_public_key, node_id, payment_address
 
     settings = get_settings()
     identity_file = settings.full_identity_path
@@ -339,7 +341,20 @@ def generate_node_identity() -> None:
             node_private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
             node_public_key = node_private_key.public_key()
             node_id = data['node_id']
+            payment_address = data.get('payment_address', '')
+
+            # Generate payment address if not saved (for old identities)
+            if not payment_address:
+                pub_bytes = get_public_bytes(node_public_key)
+                payment_address = f"0x{hashlib.sha256(pub_bytes).hexdigest()}"
+                # Update identity file with payment address
+                data['payment_address'] = payment_address
+                with open(identity_file, 'w') as f:
+                    json.dump(data, f)
+                logger.info(f"Generated payment address for existing identity: {payment_address}")
+
             logger.info(f"Loaded node identity: {node_id}")
+            logger.info(f"Wallet address: {payment_address}")
             return
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logger.error(f"Failed to load identity from {identity_file}: {e}")
@@ -354,14 +369,22 @@ def generate_node_identity() -> None:
     pub_bytes = get_public_bytes(node_public_key)
     node_id = f"apn_{pub_bytes[:8].hex()}"
 
-    # Save identity
+    # Generate unique wallet address from public key hash
+    payment_address = f"0x{hashlib.sha256(pub_bytes).hexdigest()}"
+
+    # Save identity with payment address
     seed = get_private_bytes(node_private_key)
     try:
         settings.ensure_config_dir()
         with open(identity_file, 'w') as f:
-            json.dump({'seed': seed.hex(), 'node_id': node_id}, f)
+            json.dump({
+                'seed': seed.hex(),
+                'node_id': node_id,
+                'payment_address': payment_address
+            }, f)
         identity_file.chmod(0o600)  # Secure file permissions
         logger.info(f"Generated new node identity: {node_id}")
+        logger.info(f"Generated wallet address: {payment_address}")
     except IOError as e:
         logger.error(f"Failed to save identity file: {e}")
 
