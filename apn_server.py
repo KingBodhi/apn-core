@@ -41,6 +41,7 @@ from cryptography.exceptions import InvalidSignature
 from core.settings import get_settings, APNSettings
 from core.database import get_database, close_database, APNDatabase
 from core.logging_config import setup_logging, get_logger
+from core.heartbeat_service import start_heartbeat_service, stop_heartbeat_service
 
 # System resources
 try:
@@ -222,10 +223,35 @@ async def lifespan(app: FastAPI):
     # Start mesh peer connections in background
     asyncio.create_task(connect_to_mesh_peers())
 
+    # Start heartbeat service if contribution is enabled
+    if contribution and contribution.get('enabled', False):
+        try:
+            capabilities = []
+            if contribution.get('relay_enabled'): capabilities.append('relay')
+            if contribution.get('compute_enabled'): capabilities.append('compute')
+            if contribution.get('storage_enabled'): capabilities.append('storage')
+
+            await start_heartbeat_service(
+                nats_url=settings.nats_relay,
+                node_id=node_id,
+                wallet_address=payment_address or "0x0000000000000000000000000000000000000000",
+                capabilities=capabilities or ['compute', 'relay', 'storage']
+            )
+            logger.info("✅ Heartbeat service started - earning VIBE rewards!")
+        except Exception as e:
+            logger.error(f"Failed to start heartbeat service: {e}")
+
     yield  # Server runs here
 
     # Shutdown
     logger.info("Shutting down APN CORE Server...")
+
+    # Stop heartbeat service
+    try:
+        await stop_heartbeat_service()
+    except Exception as e:
+        logger.error(f"Error stopping heartbeat service: {e}")
+
     await close_database()
 
 
