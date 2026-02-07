@@ -1,29 +1,21 @@
 """
 APN CORE - Main Application Entry Point
-Alpha Protocol Network GUI with integrated mesh networking.
+Alpha Protocol Network - Modern GUI
 
-Version: 1.0.0
+Version: 2.0.0-minimal
 """
 import sys
 import asyncio
 import threading
-from pathlib import Path
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 # Core APN imports
-from core.config import APNConfig, APN_CORE_VERSION
-from core.logging_config import setup_logging
-from core.service_manager import ServiceManager
+from core.logging_config import setup_logging, get_logger
+from core.settings import get_settings
 
-# GUI imports
-from app.main_window import MainWindow
-
-# Legacy compatibility
-from app.pages import globals
-
-# Global service manager instance
-service_manager = None
+# Modern GUI
+from app.modern_ui import APNModernUI
 
 # APN Server thread
 apn_server_thread = None
@@ -52,32 +44,27 @@ def main():
     global apn_server_thread
 
     # Setup logging
-    logger = setup_logging("INFO")
-    logger.info(f"Starting APN CORE v{APN_CORE_VERSION}")
-    logger.info("Alpha Protocol Network - Sovereign Mesh Node")
+    settings = get_settings()
+    setup_logging(settings.log_level)
+    logger = get_logger("main")
+
+    logger.info("Starting APN CORE v2.0.0-minimal")
+    logger.info("Alpha Protocol Network - Modern Client")
 
     try:
-        # Load configuration
-        config = APNConfig.load()
-        logger.info(f"Loaded configuration for node: {config.identity.node_id}")
-
         # Start APN Core server in background thread
         logger.info("Starting APN Core server on port 8000...")
         apn_server_thread = threading.Thread(target=start_apn_server, daemon=True)
         apn_server_thread.start()
         logger.info("APN Core server started in background")
 
-        # Fix for QWebEngineView
-        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
-
         # Start PyQt UI
         app = QApplication(sys.argv)
-        window = MainWindow(config)
-        window.setWindowTitle(f"APN CORE v{APN_CORE_VERSION}")
-        window.show()
 
-        # Start services after window is shown (like original)
-        window.start_service()
+        # Modern UI with dark theme
+        window = APNModernUI()
+        window.setWindowTitle("APN Core v2.0.0")
+        window.show()
 
         # Start the GUI event loop
         exit_code = app.exec()
