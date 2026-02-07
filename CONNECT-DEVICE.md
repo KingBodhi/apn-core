@@ -18,26 +18,32 @@ pip install nats-py>=2.6.0
 
 ### 2. Run APN Core
 
+**Option A - Using launcher (recommended):**
 ```bash
-python main.py
+./launch.sh
 ```
 
-The GUI will open automatically.
+**Option B - Direct Python:**
+```bash
+python3.10 main.py
+```
+
+The modern GUI will open automatically, displaying your wallet address prominently.
 
 ### 3. Enable Device Contribution
 
-1. Go to the **"Node Config"** tab
-2. Check **"Enable Device Contribution"**
-3. Select services to contribute:
-   - ✅ Relay (share bandwidth)
-   - ✅ Compute (share CPU)
-   - ✅ Storage (share disk)
-4. Click **"Start Contributing"**
+The new modern UI features a clean card-based design:
 
-Your device will:
+1. **Wallet Card** - Your unique wallet address is displayed prominently at the top
+2. **Network Status Card** - Shows connection status to NATS relay
+3. **Contribution Card** - Click **"Enable Contribution"** button
+4. **Resources Card** - Displays your system's CPU, RAM, Storage, GPU
+
+Once enabled, your device will:
 - Connect to NATS relay: `nats://nonlocal.info:4222`
 - Send heartbeats every 30 seconds
 - Earn VIBE rewards automatically!
+- Show live status updates every 5 seconds
 
 ---
 
