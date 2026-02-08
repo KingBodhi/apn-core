@@ -124,8 +124,14 @@ class APNSettings(BaseSettings):
         return self.config_dir / self.identity_file
 
     def ensure_config_dir(self) -> None:
-        """Ensure configuration directory exists"""
+        """Ensure configuration directory exists with proper permissions"""
         self.config_dir.mkdir(parents=True, exist_ok=True)
+        # Set secure permissions (owner read/write/execute only)
+        try:
+            self.config_dir.chmod(0o700)
+        except Exception:
+            # Ignore permission errors on some filesystems
+            pass
 
     def is_origin_allowed(self, origin: str) -> bool:
         """Check if an origin is allowed for CORS"""

@@ -58,37 +58,90 @@ def get_private_bytes(key) -> bytes:
 
 
 def generate_node_identity() -> None:
-    """Generate Ed25519 keypair for node identity and wallet address"""
+    """Generate Ed25519 keypair for node identity and wallet address
+
+    This function ensures persistent node identity across restarts by:
+    1. Loading existing identity from ~/.apn/node_identity.json if it exists
+    2. Creating backup before any modifications
+    3. Validating saved identity can be re-loaded
+    4. Failing loudly if identity file is corrupted (rather than silently creating new one)
+    """
     global node_private_key, node_public_key, node_id, payment_address
 
     settings = get_settings()
     identity_file = settings.full_identity_path
+    backup_file = settings.config_dir / "node_identity.json.backup"
 
+    # Attempt to load existing identity
     if identity_file.exists():
         try:
             with open(identity_file, 'r') as f:
                 data = json.load(f)
+
+            # Validate required fields
+            if 'seed' not in data or 'node_id' not in data:
+                raise ValueError("Identity file missing required fields (seed, node_id)")
+
             seed = bytes.fromhex(data['seed'])
             node_private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
             node_public_key = node_private_key.public_key()
             node_id = data['node_id']
             payment_address = data.get('payment_address', '')
 
-            # Generate payment address if not saved
+            # Generate payment address if not saved (backwards compatibility)
             if not payment_address:
                 pub_bytes = get_public_bytes(node_public_key)
                 payment_address = f"0x{hashlib.sha256(pub_bytes).hexdigest()}"
+
+                # Create backup before modifying
+                try:
+                    import shutil
+                    shutil.copy2(identity_file, backup_file)
+                    logger.info(f"Created backup: {backup_file}")
+                except Exception as e:
+                    logger.warning(f"Could not create backup: {e}")
+
+                # Update identity file with payment address
                 data['payment_address'] = payment_address
-                with open(identity_file, 'w') as f:
-                    json.dump(data, f)
+                try:
+                    with open(identity_file, 'w') as f:
+                        json.dump(data, f, indent=2)
+                    identity_file.chmod(0o600)
+                except Exception as e:
+                    logger.error(f"Failed to update identity file: {e}")
+                    # Restore from backup if update failed
+                    if backup_file.exists():
+                        import shutil
+                        shutil.copy2(backup_file, identity_file)
+                        logger.info("Restored identity from backup")
 
-            logger.info(f"Loaded node identity: {node_id}")
-            logger.info(f"Wallet address: {payment_address}")
+            logger.info(f"✓ Loaded existing node identity: {node_id}")
+            logger.info(f"✓ Wallet address: {payment_address}")
+            logger.info(f"✓ Identity file: {identity_file}")
             return
-        except Exception as e:
-            logger.error(f"Failed to load identity: {e}")
 
-    # Generate new identity
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ CRITICAL: Identity file is corrupted (invalid JSON): {e}")
+            logger.error(f"❌ File location: {identity_file}")
+            logger.error(f"❌ Please backup/fix the file manually or delete it to generate new identity")
+            logger.error(f"❌ WARNING: Deleting will create NEW wallet and LOSE accumulated VIBE!")
+            raise SystemExit(1)
+
+        except ValueError as e:
+            logger.error(f"❌ CRITICAL: Identity file is invalid: {e}")
+            logger.error(f"❌ File location: {identity_file}")
+            logger.error(f"❌ Please backup/fix the file manually or delete it to generate new identity")
+            raise SystemExit(1)
+
+        except Exception as e:
+            logger.error(f"❌ CRITICAL: Failed to load identity file: {e}")
+            logger.error(f"❌ File location: {identity_file}")
+            logger.error(f"❌ Please check file permissions and try again")
+            raise SystemExit(1)
+
+    # Generate new identity (only if file doesn't exist)
+    logger.info("No existing identity found, generating new node identity...")
+
     node_private_key = ed25519.Ed25519PrivateKey.generate()
     node_public_key = node_private_key.public_key()
 
@@ -101,19 +154,40 @@ def generate_node_identity() -> None:
 
     # Save identity
     seed = get_private_bytes(node_private_key)
+    identity_data = {
+        'seed': seed.hex(),
+        'node_id': node_id,
+        'payment_address': payment_address,
+        'created_at': datetime.now(timezone.utc).isoformat()
+    }
+
     try:
+        # Ensure config directory exists with proper permissions
         settings.ensure_config_dir()
+        settings.config_dir.chmod(0o700)
+
+        # Write identity file
         with open(identity_file, 'w') as f:
-            json.dump({
-                'seed': seed.hex(),
-                'node_id': node_id,
-                'payment_address': payment_address
-            }, f)
+            json.dump(identity_data, f, indent=2)
         identity_file.chmod(0o600)
-        logger.info(f"Generated new node identity: {node_id}")
-        logger.info(f"Generated wallet address: {payment_address}")
-    except IOError as e:
-        logger.error(f"Failed to save identity file: {e}")
+
+        # Verify the file was written correctly by re-loading it
+        with open(identity_file, 'r') as f:
+            verification = json.load(f)
+        if verification.get('node_id') != node_id:
+            raise ValueError("Identity verification failed - saved file doesn't match")
+
+        logger.info(f"✓ Generated new node identity: {node_id}")
+        logger.info(f"✓ Generated wallet address: {payment_address}")
+        logger.info(f"✓ Identity saved to: {identity_file}")
+        logger.info(f"✓ Config directory: {settings.config_dir}")
+        logger.warning("⚠️  IMPORTANT: Back up ~/.apn/node_identity.json to preserve your wallet!")
+
+    except Exception as e:
+        logger.error(f"❌ CRITICAL: Failed to save identity file: {e}")
+        logger.error(f"❌ Cannot start without persistent identity")
+        logger.error(f"❌ Please check directory permissions: {settings.config_dir}")
+        raise SystemExit(1)
 
 
 @asynccontextmanager
