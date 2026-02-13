@@ -29,7 +29,11 @@ logger = get_logger("heartbeat")
 
 
 class HeartbeatService:
-    """Manages periodic heartbeats to the APN network"""
+    """Manages periodic heartbeats to the APN network.
+
+    Heartbeats include capability advertisement so other nodes
+    and Pythia can discover what this node can execute.
+    """
 
     def __init__(self, nats_url: str, node_id: str, wallet_address: str, capabilities: list):
         self.nats_url = nats_url
@@ -39,6 +43,8 @@ class HeartbeatService:
         self.nats = None
         self.running = False
         self.heartbeat_task = None
+        self._agents: list = []
+        self._software: dict = {}
 
     async def start(self):
         """Start the heartbeat service"""
@@ -90,27 +96,39 @@ class HeartbeatService:
 
         logger.info("Heartbeat service stopped")
 
+    def update_capabilities(self, agents: list = None, software: dict = None):
+        """Update capability advertisement for heartbeats"""
+        if agents is not None:
+            self._agents = agents
+        if software is not None:
+            self._software = software
+
     async def send_discovery(self):
-        """Send initial discovery announcement"""
+        """Send initial discovery announcement with full capability info"""
         if not self.nats:
             return
 
         resources = self._collect_resources()
+        self._load_capabilities()
 
         announcement = {
             "node_id": self.node_id,
             "wallet_address": self.wallet_address,
+            "hostname": self._get_hostname(),
             "capabilities": self.capabilities,
+            "agents": self._agents,
+            "software": self._software,
             "resources": resources,
+            "version": "3.0.0",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         payload = json.dumps(announcement).encode()
         await self.nats.publish("apn.discovery", payload)
-        logger.info(f"📢 Sent discovery announcement to apn.discovery")
+        logger.info("Sent discovery announcement to apn.discovery")
 
     async def send_heartbeat(self):
-        """Send a single heartbeat"""
+        """Send a single heartbeat with capabilities"""
         if not self.nats:
             return
 
@@ -119,14 +137,17 @@ class HeartbeatService:
         heartbeat = {
             "node_id": self.node_id,
             "wallet_address": self.wallet_address,
+            "hostname": self._get_hostname(),
             "capabilities": self.capabilities,
+            "agents": self._agents,
+            "software": self._software,
             "resources": resources,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         payload = json.dumps(heartbeat).encode()
         await self.nats.publish("apn.heartbeat", payload)
-        logger.debug(f"💓 Sent heartbeat to apn.heartbeat")
+        logger.debug("Sent heartbeat to apn.heartbeat")
 
     async def _heartbeat_loop(self):
         """Main heartbeat loop - sends heartbeat every 30 seconds"""
@@ -139,6 +160,37 @@ class HeartbeatService:
             except Exception as e:
                 logger.error(f"Heartbeat error: {e}")
                 await asyncio.sleep(30)  # Continue even on error
+
+    def _get_hostname(self) -> str:
+        """Get friendly hostname from config, falling back to system hostname"""
+        try:
+            from pathlib import Path
+            config_file = Path.home() / ".apn" / "apn_config.json"
+            if config_file.exists():
+                import json as _json
+                with open(config_file, 'r') as f:
+                    config = _json.load(f)
+                name = config.get("device_name", "").strip()
+                if name:
+                    return name
+        except Exception:
+            pass
+        return platform.node()
+
+    def _load_capabilities(self):
+        """Load capabilities from ~/.apn/capabilities.json if not already set"""
+        if self._agents:
+            return
+        try:
+            from pathlib import Path
+            caps_file = Path.home() / ".apn" / "capabilities.json"
+            if caps_file.exists():
+                with open(caps_file, 'r') as f:
+                    caps = json.load(f)
+                self._agents = caps.get("agents", [])
+                self._software = caps.get("software", {})
+        except Exception:
+            pass
 
     def _collect_resources(self) -> Optional[Dict[str, Any]]:
         """Collect system resources for heartbeat"""

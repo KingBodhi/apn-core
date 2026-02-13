@@ -450,6 +450,9 @@ class APNModernUI(QMainWindow):
 
     def refresh_data(self):
         """Refresh all dynamic data"""
+        # Retry loading wallet/node info if it failed on startup (race condition)
+        if self.wallet_address in ("Loading...", "Unknown"):
+            self.load_node_info()
         self.refresh_resources()
         self.refresh_status()
 

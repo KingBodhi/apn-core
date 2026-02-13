@@ -1,0 +1,30 @@
+[Unit]
+Description=APN Core - Alpha Protocol Network Substrate (Layer 0)
+Documentation=https://github.com/APN-Core
+After=network-online.target nats.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Environment=HOME=/home/%i
+WorkingDirectory=/home/%i/topos/apn-core
+ExecStart=/usr/bin/python3 /home/%i/topos/apn-core/apn_server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apn-core
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/%i/topos /home/%i/.apn /tmp
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
