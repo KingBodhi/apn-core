@@ -138,6 +138,7 @@ class HeartbeatService:
             "node_id": self.node_id,
             "wallet_address": self.wallet_address,
             "hostname": self._get_hostname(),
+            "device_name": self._get_hostname(),
             "capabilities": self.capabilities,
             "agents": self._agents,
             "software": self._software,
@@ -148,6 +149,15 @@ class HeartbeatService:
         payload = json.dumps(heartbeat).encode()
         await self.nats.publish("apn.heartbeat", payload)
         logger.debug("Sent heartbeat to apn.heartbeat")
+
+        # Record heartbeat in resource accounting
+        try:
+            from core.resource_accounting import get_resource_accounting
+            accountant = get_resource_accounting()
+            if accountant:
+                accountant.record_heartbeat()
+        except Exception:
+            pass
 
     async def _heartbeat_loop(self):
         """Main heartbeat loop - sends heartbeat every 30 seconds"""
@@ -228,6 +238,17 @@ class HeartbeatService:
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
 
+            # Bandwidth detection via network interface stats
+            bandwidth_mbps = None
+            try:
+                net_stats = psutil.net_if_stats()
+                for name, stats in net_stats.items():
+                    if stats.isup and stats.speed > 0 and name != "lo":
+                        bandwidth_mbps = stats.speed
+                        break
+            except Exception:
+                pass
+
             return {
                 "cpu_cores": cpu_count,
                 "ram_mb": ram_mb,
@@ -235,7 +256,7 @@ class HeartbeatService:
                 "gpu_available": gpu_available,
                 "gpu_model": gpu_model,
                 "hashrate": None,
-                "bandwidth_mbps": None,
+                "bandwidth_mbps": bandwidth_mbps,
             }
 
         except Exception as e:

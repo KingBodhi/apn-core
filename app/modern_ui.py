@@ -147,9 +147,12 @@ class APNModernUI(QMainWindow):
 
         # Cards
         scroll_layout.addWidget(self.create_wallet_card())
+        scroll_layout.addWidget(self.create_rewards_card())
         scroll_layout.addWidget(self.create_status_card())
         scroll_layout.addWidget(self.create_contribution_card())
+        scroll_layout.addWidget(self.create_peer_network_card())
         scroll_layout.addWidget(self.create_resources_card())
+        scroll_layout.addWidget(self.create_reward_history_card())
         scroll_layout.addStretch()
 
         scroll.setWidget(scroll_widget)
@@ -312,6 +315,139 @@ class APNModernUI(QMainWindow):
 
         return card
 
+    def create_rewards_card(self):
+        """VIBE Rewards card with gold balance display"""
+        card = ModernCard()
+        layout = QVBoxLayout(card)
+        layout.setSpacing(12)
+
+        # Header
+        header = QLabel("VIBE Rewards")
+        header.setFont(QFont("SF Pro Display", 16, QFont.Weight.Bold))
+        header.setStyleSheet("color: #FFD700;")
+        layout.addWidget(header)
+
+        # Big balance display
+        self.vibe_balance_label = QLabel("0.0000 VIBE")
+        self.vibe_balance_label.setFont(QFont("SF Mono", 28, QFont.Weight.Bold))
+        self.vibe_balance_label.setStyleSheet("color: #FFD700;")
+        layout.addWidget(self.vibe_balance_label)
+
+        # Sub-balances row
+        sub_row = QWidget()
+        sub_layout = QHBoxLayout(sub_row)
+        sub_layout.setContentsMargins(0, 0, 0, 0)
+        sub_layout.setSpacing(20)
+
+        self.pending_balance_label = QLabel("Pending: 0.0000")
+        self.pending_balance_label.setFont(QFont("SF Mono", 11))
+        self.pending_balance_label.setStyleSheet("color: #f59e0b;")
+        sub_layout.addWidget(self.pending_balance_label)
+
+        self.confirmed_balance_label = QLabel("Confirmed: 0.0000")
+        self.confirmed_balance_label.setFont(QFont("SF Mono", 11))
+        self.confirmed_balance_label.setStyleSheet("color: #10b981;")
+        sub_layout.addWidget(self.confirmed_balance_label)
+
+        sub_layout.addStretch()
+        layout.addWidget(sub_row)
+
+        # Earning rate row
+        rate_row = QWidget()
+        rate_layout = QHBoxLayout(rate_row)
+        rate_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.earning_rate_label = QLabel("Earning: -- VIBE/hr")
+        self.earning_rate_label.setFont(QFont("SF Pro Display", 12))
+        self.earning_rate_label.setStyleSheet("color: #9ca3af;")
+        rate_layout.addWidget(self.earning_rate_label)
+
+        rate_layout.addStretch()
+
+        self.earning_status_indicator = StatusIndicator("offline")
+        rate_layout.addWidget(self.earning_status_indicator)
+
+        layout.addWidget(rate_row)
+
+        return card
+
+    def create_peer_network_card(self):
+        """Peer Network card with active peers list"""
+        card = ModernCard()
+        layout = QVBoxLayout(card)
+        layout.setSpacing(12)
+
+        # Header row
+        header_layout = QHBoxLayout()
+        header = QLabel("Peer Network")
+        header.setFont(QFont("SF Pro Display", 16, QFont.Weight.Bold))
+        header.setStyleSheet("color: #ffffff;")
+        header_layout.addWidget(header)
+        header_layout.addStretch()
+
+        self.peer_count_label = QLabel("0 peers")
+        self.peer_count_label.setFont(QFont("SF Mono", 13))
+        self.peer_count_label.setStyleSheet("color: #3b82f6;")
+        header_layout.addWidget(self.peer_count_label)
+
+        layout.addLayout(header_layout)
+
+        # Scrollable peer list
+        self.peer_list_widget = QWidget()
+        self.peer_list_layout = QVBoxLayout(self.peer_list_widget)
+        self.peer_list_layout.setContentsMargins(0, 0, 0, 0)
+        self.peer_list_layout.setSpacing(6)
+
+        no_peers = QLabel("No peers connected yet")
+        no_peers.setFont(QFont("SF Pro Display", 12))
+        no_peers.setStyleSheet("color: #6b7280;")
+        self.peer_list_layout.addWidget(no_peers)
+
+        peer_scroll = QScrollArea()
+        peer_scroll.setWidgetResizable(True)
+        peer_scroll.setMaximumHeight(160)
+        peer_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        peer_scroll.setStyleSheet(
+            "QScrollArea { background-color: transparent; border: none; }"
+        )
+        peer_scroll.setWidget(self.peer_list_widget)
+        layout.addWidget(peer_scroll)
+
+        return card
+
+    def create_reward_history_card(self):
+        """Recent Rewards card with scrollable history"""
+        card = ModernCard()
+        layout = QVBoxLayout(card)
+        layout.setSpacing(12)
+
+        header = QLabel("Recent Rewards")
+        header.setFont(QFont("SF Pro Display", 16, QFont.Weight.Bold))
+        header.setStyleSheet("color: #ffffff;")
+        layout.addWidget(header)
+
+        self.reward_history_widget = QWidget()
+        self.reward_history_layout = QVBoxLayout(self.reward_history_widget)
+        self.reward_history_layout.setContentsMargins(0, 0, 0, 0)
+        self.reward_history_layout.setSpacing(4)
+
+        no_rewards = QLabel("No rewards yet - enable contribution to start earning")
+        no_rewards.setFont(QFont("SF Pro Display", 12))
+        no_rewards.setStyleSheet("color: #6b7280;")
+        self.reward_history_layout.addWidget(no_rewards)
+
+        history_scroll = QScrollArea()
+        history_scroll.setWidgetResizable(True)
+        history_scroll.setMaximumHeight(180)
+        history_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        history_scroll.setStyleSheet(
+            "QScrollArea { background-color: transparent; border: none; }"
+        )
+        history_scroll.setWidget(self.reward_history_widget)
+        layout.addWidget(history_scroll)
+
+        return card
+
     def create_status_row(self, label, value):
         """Create a status row"""
         widget = QWidget()
@@ -455,6 +591,9 @@ class APNModernUI(QMainWindow):
             self.load_node_info()
         self.refresh_resources()
         self.refresh_status()
+        self.refresh_rewards()
+        self.refresh_peer_list()
+        self.refresh_reward_history()
 
     def refresh_resources(self):
         """Refresh system resources"""
@@ -553,6 +692,159 @@ class APNModernUI(QMainWindow):
         except Exception as e:
             self.status_indicator.update_status("error")
             print(f"Failed to refresh status: {e}")
+
+    def refresh_rewards(self):
+        """Refresh VIBE rewards balance from API"""
+        try:
+            response = httpx.get("http://localhost:8000/api/rewards/balance", timeout=2.0)
+            if response.status_code == 200:
+                data = response.json()
+                balance = data.get("balance", {})
+
+                total = balance.get("total_earned_vibe", 0)
+                pending = balance.get("pending_vibe", 0)
+                confirmed = balance.get("confirmed_vibe", 0)
+                rate = balance.get("earning_rate_per_hour", 0)
+
+                self.vibe_balance_label.setText(f"{total:.4f} VIBE")
+                self.pending_balance_label.setText(f"Pending: {pending:.4f}")
+                self.confirmed_balance_label.setText(f"Confirmed: {confirmed:.4f}")
+
+                if rate > 0:
+                    self.earning_rate_label.setText(f"Earning: {rate:.4f} VIBE/hr")
+                    self.earning_status_indicator.update_status("online")
+                else:
+                    self.earning_rate_label.setText("Earning: -- VIBE/hr")
+                    self.earning_status_indicator.update_status("offline")
+        except Exception:
+            pass
+
+    def refresh_peer_list(self):
+        """Refresh peer network list from API"""
+        try:
+            response = httpx.get("http://localhost:8000/api/peers/active", timeout=2.0)
+            if response.status_code == 200:
+                data = response.json()
+                peers = data.get("peers", [])
+                count = data.get("peer_count", 0)
+
+                self.peer_count_label.setText(f"{count} peer{'s' if count != 1 else ''}")
+
+                # Clear existing items
+                while self.peer_list_layout.count():
+                    item = self.peer_list_layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+
+                if not peers:
+                    no_peers = QLabel("No peers connected yet")
+                    no_peers.setFont(QFont("SF Pro Display", 12))
+                    no_peers.setStyleSheet("color: #6b7280;")
+                    self.peer_list_layout.addWidget(no_peers)
+                    return
+
+                for peer in peers[:20]:
+                    row = QWidget()
+                    row_layout = QHBoxLayout(row)
+                    row_layout.setContentsMargins(4, 2, 4, 2)
+                    row_layout.setSpacing(8)
+
+                    hostname = peer.get("hostname") or peer.get("node_id", "???")[:16]
+                    name_label = QLabel(hostname)
+                    name_label.setFont(QFont("SF Mono", 11))
+                    name_label.setStyleSheet("color: #e5e7eb;")
+                    row_layout.addWidget(name_label)
+
+                    row_layout.addStretch()
+
+                    # Resource indicators
+                    indicators = []
+                    cpu = peer.get("cpu_cores")
+                    if cpu:
+                        indicators.append(f"{cpu}C")
+                    ram = peer.get("ram_mb")
+                    if ram:
+                        indicators.append(f"{ram // 1024}G")
+                    if peer.get("gpu_available"):
+                        indicators.append("GPU")
+
+                    if indicators:
+                        ind_label = QLabel(" | ".join(indicators))
+                        ind_label.setFont(QFont("SF Mono", 10))
+                        ind_label.setStyleSheet("color: #6b7280;")
+                        row_layout.addWidget(ind_label)
+
+                    self.peer_list_layout.addWidget(row)
+        except Exception:
+            pass
+
+    def refresh_reward_history(self):
+        """Refresh recent reward events from API"""
+        try:
+            response = httpx.get(
+                "http://localhost:8000/api/rewards/history?limit=10", timeout=2.0
+            )
+            if response.status_code == 200:
+                data = response.json()
+                history = data.get("history", [])
+
+                # Clear existing items
+                while self.reward_history_layout.count():
+                    item = self.reward_history_layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+
+                if not history:
+                    no_rewards = QLabel(
+                        "No rewards yet - enable contribution to start earning"
+                    )
+                    no_rewards.setFont(QFont("SF Pro Display", 12))
+                    no_rewards.setStyleSheet("color: #6b7280;")
+                    self.reward_history_layout.addWidget(no_rewards)
+                    return
+
+                for entry in history:
+                    row = QWidget()
+                    row_layout = QHBoxLayout(row)
+                    row_layout.setContentsMargins(4, 2, 4, 2)
+                    row_layout.setSpacing(8)
+
+                    # Timestamp (just time portion)
+                    ts = entry.get("created_at", "")
+                    time_str = ts[11:19] if len(ts) > 19 else ts
+                    time_label = QLabel(time_str)
+                    time_label.setFont(QFont("SF Mono", 10))
+                    time_label.setStyleSheet("color: #6b7280;")
+                    row_layout.addWidget(time_label)
+
+                    # Type
+                    rtype = entry.get("type", "?")
+                    type_label = QLabel(rtype)
+                    type_label.setFont(QFont("SF Mono", 10))
+                    type_label.setStyleSheet("color: #9ca3af;")
+                    type_label.setFixedWidth(70)
+                    row_layout.addWidget(type_label)
+
+                    row_layout.addStretch()
+
+                    # Multiplier
+                    mult = entry.get("multiplier", 1.0)
+                    if mult != 1.0:
+                        mult_label = QLabel(f"{mult:.1f}x")
+                        mult_label.setFont(QFont("SF Mono", 10))
+                        mult_label.setStyleSheet("color: #a78bfa;")
+                        row_layout.addWidget(mult_label)
+
+                    # Amount
+                    amount = entry.get("final_vibe", 0)
+                    amount_label = QLabel(f"+{amount:.4f}")
+                    amount_label.setFont(QFont("SF Mono", 11, QFont.Weight.Bold))
+                    amount_label.setStyleSheet("color: #FFD700;")
+                    row_layout.addWidget(amount_label)
+
+                    self.reward_history_layout.addWidget(row)
+        except Exception:
+            pass
 
 
 def main():

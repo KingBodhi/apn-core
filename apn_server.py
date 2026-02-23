@@ -47,6 +47,13 @@ from core.task_runtime import start_task_runtime, stop_task_runtime, get_task_ru
 from core.file_transfer import start_file_transfer, stop_file_transfer, get_file_transfer
 from core.cloud_import import start_cloud_import, get_cloud_import
 from core.crypto import encrypt_task_payload, decrypt_task_payload
+from core.database import (
+    init_database, close_database, get_database, vibe_to_display,
+)
+from core.resource_accounting import start_resource_accounting, get_resource_accounting
+from core.reward_tracker import (
+    start_reward_tracker, stop_reward_tracker, get_reward_tracker,
+)
 
 # Logging
 logger = get_logger("server")
@@ -285,7 +292,18 @@ async def lifespan(app: FastAPI):
     logger.info(f"    POST http://localhost:{settings.port}/api/voice/chat")
     logger.info("")
 
-    # Start heartbeat service if contribution enabled
+    # 1. Initialize database
+    try:
+        await init_database()
+        logger.info("Database initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+
+    # 2. Start resource accounting
+    start_resource_accounting()
+    logger.info("Resource accounting started")
+
+    # 3. Start heartbeat service if contribution enabled
     if contribution and contribution.get('enabled', False):
         try:
             capabilities = []
@@ -303,10 +321,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to start heartbeat service: {e}")
 
-    # Start peer listener (subscribes to apn.heartbeat to track peers)
+    # 4. Start reward tracker (local VIBE reward estimation)
+    try:
+        await start_reward_tracker(
+            own_node_id=node_id,
+            own_wallet_address=payment_address,
+        )
+        logger.info("Reward tracker started - tracking VIBE earnings!")
+    except Exception as e:
+        logger.error(f"Failed to start reward tracker: {e}")
+
+    # 5. Start peer listener (subscribes to apn.heartbeat to track peers)
     asyncio.create_task(_start_peer_listener())
 
-    # Start task runtime (receives tasks from Pythia via NATS)
+    # 6. Start task runtime (receives tasks from Pythia via NATS)
     try:
         await start_task_runtime(
             nats_url=settings.nats_relay,
@@ -317,7 +345,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start task runtime: {e}")
 
-    # Start file transfer service (P2P file transfers via NATS)
+    # 7. Start file transfer service (P2P file transfers via NATS)
     try:
         await start_file_transfer(
             nats_url=settings.nats_relay,
@@ -327,14 +355,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to start file transfer service: {e}")
 
-    # Start cloud import service (Google Drive, OneDrive, Dropbox downloads)
+    # 8. Start cloud import service (Google Drive, OneDrive, Dropbox downloads)
     start_cloud_import()
     logger.info("Cloud import service started - ready for cloud downloads!")
 
+    # 9. Start periodic stale peer cleanup (every 5 min)
+    asyncio.create_task(_periodic_stale_cleanup())
+
     yield
 
-    # Shutdown
+    # Shutdown (reverse order)
     logger.info("Shutting down APN Core...")
+    try:
+        await stop_reward_tracker()
+    except Exception as e:
+        logger.error(f"Error stopping reward tracker: {e}")
     try:
         await stop_file_transfer()
     except Exception as e:
@@ -347,10 +382,18 @@ async def lifespan(app: FastAPI):
         await stop_heartbeat_service()
     except Exception as e:
         logger.error(f"Error stopping heartbeat service: {e}")
+    try:
+        await close_database()
+    except Exception as e:
+        logger.error(f"Error closing database: {e}")
 
 
 async def _start_peer_listener():
-    """Subscribe to apn.heartbeat and apn.discovery to track network peers"""
+    """Subscribe to apn.heartbeat and apn.discovery to track network peers.
+
+    Dispatches heartbeats to BOTH the in-memory peer registry AND the
+    reward tracker for persistent tracking and reward calculation.
+    """
     try:
         from nats.aio.client import Client as NATS
     except ImportError:
@@ -368,7 +411,11 @@ async def _start_peer_listener():
             try:
                 data = json.loads(msg.data.decode())
                 peer_id = data.get("node_id", "")
-                if peer_id and peer_id != node_id:
+                if not peer_id:
+                    return
+
+                # 1. Update in-memory peer registry (skip own node)
+                if peer_id != node_id:
                     async with _peer_registry_lock:
                         _peer_registry[peer_id] = {
                             "node_id": peer_id,
@@ -377,9 +424,21 @@ async def _start_peer_listener():
                             "resources": data.get("resources"),
                             "agents": data.get("agents", []),
                             "software": data.get("software", {}),
+                            "hostname": data.get("hostname", ""),
                             "last_seen": datetime.now(timezone.utc).isoformat(),
                             "connection_type": "NATS",
                         }
+
+                # 2. Dispatch to reward tracker (ALL nodes including own)
+                tracker = get_reward_tracker()
+                if tracker:
+                    await tracker.on_heartbeat(data)
+
+                # 3. Record relay activity in resource accounting
+                accountant = get_resource_accounting()
+                if accountant and peer_id != node_id:
+                    accountant.record_relay()
+
             except Exception as e:
                 logger.debug(f"Failed to parse heartbeat: {e}")
 
@@ -390,10 +449,9 @@ async def _start_peer_listener():
         await nc.subscribe("apn.discovery", cb=on_discovery)
         logger.info("Subscribed to apn.heartbeat and apn.discovery")
 
-        # Keep connection alive
+        # Keep connection alive and prune stale in-memory peers
         while True:
             await asyncio.sleep(60)
-            # Prune stale peers (not seen in 5 minutes)
             cutoff = datetime.now(timezone.utc).timestamp() - 300
             async with _peer_registry_lock:
                 stale = [
@@ -403,13 +461,27 @@ async def _start_peer_listener():
                 for pid in stale:
                     del _peer_registry[pid]
                 if stale:
-                    logger.debug(f"Pruned {len(stale)} stale peers")
+                    logger.debug(f"Pruned {len(stale)} stale in-memory peers")
 
     except Exception as e:
         logger.error(f"Peer listener failed: {e}")
-        # Retry after delay
         await asyncio.sleep(10)
         asyncio.create_task(_start_peer_listener())
+
+
+async def _periodic_stale_cleanup():
+    """Mark stale peers as inactive in the database every 5 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(300)
+            db = await get_database()
+            if db:
+                await db.mark_stale_inactive(stale_minutes=5)
+                logger.debug("Ran periodic stale peer cleanup")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"Stale cleanup error: {e}")
 
 
 async def load_contribution_settings():
@@ -553,13 +625,191 @@ async def get_network_stats():
 
     resources = collect_system_resources()
 
+    # Add DB-backed network totals
+    db_totals = {}
+    db = await get_database()
+    if db:
+        try:
+            db_totals = await db.get_network_totals()
+        except Exception:
+            pass
+
     return {
         "node_id": node_id,
         "status": "online",
         "peers_connected": peer_count,
+        "db_peer_count": db_totals.get("peer_count", 0),
+        "network_totals": {
+            "total_cpu_cores": db_totals.get("total_cpu_cores", 0),
+            "total_ram_mb": db_totals.get("total_ram_mb", 0),
+            "total_storage_gb": db_totals.get("total_storage_gb", 0),
+            "gpu_node_count": db_totals.get("gpu_node_count", 0),
+        },
         "relay_url": get_settings().nats_relay,
         "uptime_seconds": int(time.time() - _server_start_time) if _server_start_time else 0,
         "resources": resources,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ============= Reward Endpoints =============
+
+
+@app.get("/api/rewards/balance")
+async def get_reward_balance():
+    """Get own reward summary (pending/distributed/confirmed VIBE + USD estimate)"""
+    db = await get_database()
+    if not db:
+        return {"error": "Database not initialized", "balance": None}
+
+    peer_id = await db.get_peer_id(node_id)
+    if not peer_id:
+        return {
+            "node_id": node_id,
+            "balance": {
+                "pending_vibe": 0.0,
+                "distributed_vibe": 0.0,
+                "confirmed_vibe": 0.0,
+                "total_earned_vibe": 0.0,
+                "pending_usd": 0.0,
+                "total_earned_usd": 0.0,
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    summary = await db.get_reward_summary(peer_id)
+    pending = vibe_to_display(summary["pending_rewards"])
+    distributed = vibe_to_display(summary["distributed_rewards"])
+    confirmed = vibe_to_display(summary["confirmed_rewards"])
+    total = vibe_to_display(summary["total_earned_lifetime"])
+
+    # Estimate earning rate from uptime
+    uptime_hrs = (time.time() - _server_start_time) / 3600 if _server_start_time else 0
+    rate_per_hour = total / uptime_hrs if uptime_hrs > 0.01 else 0.0
+
+    return {
+        "node_id": node_id,
+        "balance": {
+            "pending_vibe": round(pending, 8),
+            "distributed_vibe": round(distributed, 8),
+            "confirmed_vibe": round(confirmed, 8),
+            "total_earned_vibe": round(total, 8),
+            "pending_usd": round(pending * 0.01, 4),
+            "total_earned_usd": round(total * 0.01, 4),
+            "earning_rate_per_hour": round(rate_per_hour, 4),
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/rewards/history")
+async def get_reward_history(limit: int = 50):
+    """Get reward transaction history"""
+    db = await get_database()
+    if not db:
+        return {"history": [], "error": "Database not initialized"}
+
+    peer_id = await db.get_peer_id(node_id)
+    if not peer_id:
+        return {"history": []}
+
+    raw_history = await db.get_reward_history(peer_id, limit)
+
+    history = []
+    for r in raw_history:
+        history.append({
+            "id": r["id"],
+            "type": r["reward_type"],
+            "base_vibe": round(vibe_to_display(r["base_amount"]), 8),
+            "multiplier": r["multiplier"],
+            "final_vibe": round(vibe_to_display(r["final_amount"]), 8),
+            "status": r["status"],
+            "description": r["description"],
+            "created_at": r["created_at"],
+        })
+
+    return {
+        "node_id": node_id,
+        "history": history,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ============= DB-Backed Peer Endpoints =============
+
+
+@app.get("/api/peers/active")
+async def get_active_peers():
+    """Get active peers from database with resources"""
+    db = await get_database()
+    if not db:
+        # Fall back to in-memory registry
+        async with _peer_registry_lock:
+            peers = list(_peer_registry.values())
+        return {
+            "source": "memory",
+            "peer_count": len(peers),
+            "peers": peers,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    peers = await db.list_active_peers()
+
+    formatted = []
+    for p in peers:
+        formatted.append({
+            "node_id": p["node_id"],
+            "wallet_address": p["wallet_address"],
+            "hostname": p.get("hostname", ""),
+            "cpu_cores": p.get("cpu_cores"),
+            "ram_mb": p.get("ram_mb"),
+            "storage_gb": p.get("storage_gb"),
+            "gpu_available": bool(p.get("gpu_available")),
+            "gpu_model": p.get("gpu_model"),
+            "last_heartbeat_at": p.get("last_heartbeat_at"),
+            "pending_rewards_vibe": round(
+                vibe_to_display(p.get("pending_rewards") or 0), 4
+            ),
+            "total_earned_vibe": round(
+                vibe_to_display(p.get("total_earned_lifetime") or 0), 4
+            ),
+        })
+
+    return {
+        "source": "database",
+        "node_id": node_id,
+        "peer_count": len(formatted),
+        "peers": formatted,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ============= Contribution Metrics =============
+
+
+@app.get("/api/contributions/current")
+async def get_current_contributions():
+    """Get current period contribution metrics"""
+    accountant = get_resource_accounting()
+    if not accountant:
+        return {"contribution": None, "error": "Resource accounting not running"}
+
+    snap = accountant.get_current_snapshot()
+    return {
+        "node_id": node_id,
+        "contribution": {
+            "cpu_units": snap.cpu_units,
+            "gpu_units": snap.gpu_units,
+            "bandwidth_bytes": snap.bandwidth_bytes,
+            "storage_bytes": snap.storage_bytes,
+            "relay_messages": snap.relay_messages,
+            "uptime_seconds": snap.uptime_seconds,
+            "tasks_completed": snap.tasks_completed,
+            "tasks_failed": snap.tasks_failed,
+            "heartbeat_count": snap.heartbeat_count,
+            "contribution_score": snap.contribution_score(),
+        },
+        "total_uptime_seconds": accountant.uptime_seconds,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
