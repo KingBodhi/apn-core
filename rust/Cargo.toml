@@ -1,0 +1,3 @@
+[workspace]
+members = ["alpha-protocol-core"]
+resolver = "2"

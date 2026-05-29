@@ -1,0 +1,104 @@
+[package]
+name = "alpha-protocol-core"
+version = "0.1.0"
+edition = "2021"
+description = "Alpha Protocol Network - Sovereign mesh networking core"
+authors = ["OKB Ventures"]
+license = "MIT"
+
+[lib]
+name = "alpha_protocol_core"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "apn_node"
+path = "src/bin/apn_node.rs"
+
+[[bin]]
+name = "apn_send"
+path = "src/bin/apn_send.rs"
+
+[[bin]]
+name = "apn_api_server"
+path = "src/bin/apn_api_server.rs"
+
+[[bin]]
+name = "apn_reward_tracker"
+path = "src/bin/apn_reward_tracker.rs"
+
+[[bin]]
+name = "apn_reward_distributor"
+path = "src/bin/apn_reward_distributor.rs"
+
+[features]
+default = []
+mobile = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.45", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Crypto & Identity (Ed25519 + X25519)
+bip39 = "2.1"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+sha2 = "0.10"
+blake3 = "1.5"
+hex = "0.4"
+rand = "0.8"
+
+# Encryption (ChaCha20-Poly1305)
+chacha20poly1305 = "0.10"
+
+# P2P Mesh Network (libp2p)
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "tcp",
+    "noise",              # Encrypted transport
+    "yamux",              # Multiplexing
+    "gossipsub",          # Pub/sub messaging
+    "kad",                # Kademlia DHT
+    "mdns",               # Local network discovery
+    "identify",           # Peer identification
+    "ping",               # Connection health
+    "request-response",   # Request/response protocol
+    "macros",             # Derive macros for NetworkBehaviour
+] }
+
+# NATS relay fallback
+async-nats = "0.37"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# System info
+num_cpus = "1.16"
+sysinfo = "0.32"
+hostname = "0.4"
+
+# Futures
+futures = "0.3"
+
+# Web server (for API server binary)
+axum = "0.8"
+tower-http = { version = "0.5", features = ["cors"] }
+regex = "1.11"
+
+# Database (for reward services)
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+dotenv = "0.15"
+
+[dev-dependencies]
